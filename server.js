@@ -1,62 +1,137 @@
 // Servidor MCP remoto de solo lectura para tus playlists de Spotify.
 // Pensado para un único usuario: tú. Se protege con una ruta secreta.
+// Funciona en Vercel (exporta la app) y en cualquier servidor Node (app.listen).
 
 import crypto from "node:crypto";
 import express from "express";
 import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { put, get as getBlob } from "@vercel/blob";
 
 const {
   SPOTIFY_CLIENT_ID,
   SPOTIFY_CLIENT_SECRET,
-  SPOTIFY_REFRESH_TOKEN, // se obtiene una vez con /login/<MCP_SECRET>
+  SPOTIFY_REFRESH_TOKEN, // opcional si hay almacén Blob: el token se guarda solo tras /login
   MCP_SECRET, // cadena larga y aleatoria; forma parte de la URL del conector
-  PUBLIC_URL, // p. ej. https://tu-app.onrender.com (sin barra final)
+  PUBLIC_URL, // URL pública sin barra final; en Vercel se deduce sola
+  BLOB_READ_WRITE_TOKEN, // lo crea Vercel al conectar un almacén Blob al proyecto
   PORT = 3000,
 } = process.env;
 
-if (!MCP_SECRET) {
-  console.error("Falta la variable MCP_SECRET.");
-  process.exit(1);
-}
+if (!MCP_SECRET) throw new Error("Falta la variable MCP_SECRET.");
 if (!SPOTIFY_CLIENT_ID || !SPOTIFY_CLIENT_SECRET) {
   console.warn("Faltan SPOTIFY_CLIENT_ID y/o SPOTIFY_CLIENT_SECRET: el servidor arranca, pero no podrá hablar con Spotify hasta que las añadas.");
 }
 
-const BASE_URL = (PUBLIC_URL || `http://127.0.0.1:${PORT}`).replace(/\/$/, "");
+const vercelUrl = process.env.VERCEL_PROJECT_PRODUCTION_URL && `https://${process.env.VERCEL_PROJECT_PRODUCTION_URL}`;
+const BASE_URL = (PUBLIC_URL || vercelUrl || `http://127.0.0.1:${PORT}`).replace(/\/$/, "");
 const REDIRECT_URI = `${BASE_URL}/callback`;
+const LOGIN_URL = `${BASE_URL}/login/${MCP_SECRET}`;
 const SCOPES = "playlist-read-private playlist-read-collaborative";
 const API = "https://api.spotify.com/v1";
+const TOKEN_LIFETIME_DAYS = 180; // Spotify obliga a volver a iniciar sesión cada 6 meses
+const DAY = 86_400_000;
 
-// ---------- Token de Spotify ----------
-let refreshToken = SPOTIFY_REFRESH_TOKEN;
+// ---------- Almacén del refresh token ----------
+// Con Vercel Blob el token se guarda solo (al iniciar sesión y cuando Spotify lo rota).
+// Sin Blob se usa SPOTIFY_REFRESH_TOKEN y la memoria del proceso.
+const BLOB_PATH = "spotify/refresh-token.json";
+const hasBlob = Boolean(BLOB_READ_WRITE_TOKEN);
+let stored; // { refresh_token, obtained_at } | null | undefined (sin leer)
+
+async function loadToken() {
+  if (stored !== undefined) return stored;
+  stored = null;
+  if (hasBlob) {
+    try {
+      const res = await getBlob(BLOB_PATH, { access: "private" });
+      if (res?.statusCode === 200) stored = JSON.parse(await new Response(res.stream).text());
+    } catch (err) {
+      console.warn("No se pudo leer el token del almacén Blob:", err.message);
+    }
+  }
+  if (!stored?.refresh_token && SPOTIFY_REFRESH_TOKEN) {
+    stored = { refresh_token: SPOTIFY_REFRESH_TOKEN, obtained_at: null };
+  }
+  return stored;
+}
+
+async function saveToken(data) {
+  stored = data;
+  if (!hasBlob) return false;
+  await put(BLOB_PATH, JSON.stringify(data), {
+    access: "private",
+    contentType: "application/json",
+    allowOverwrite: true,
+    addRandomSuffix: false,
+    cacheControlMaxAge: 60,
+  });
+  return true;
+}
+
+async function clearToken() {
+  stored = null;
+  if (hasBlob) await saveToken({ refresh_token: null, obtained_at: null, expired_at: new Date().toISOString() });
+}
+
+function daysLeft(token) {
+  if (!token?.obtained_at) return null;
+  return Math.floor((Date.parse(token.obtained_at) + TOKEN_LIFETIME_DAYS * DAY - Date.now()) / DAY);
+}
+
+// ---------- Token de acceso de Spotify ----------
 let accessToken = null;
 let accessTokenExpiresAt = 0;
 
 const basicAuth = () =>
   "Basic " + Buffer.from(`${SPOTIFY_CLIENT_ID}:${SPOTIFY_CLIENT_SECRET}`).toString("base64");
 
+const reloginMessage = (why) =>
+  `${why} Spotify obliga a volver a iniciar sesión cada 6 meses. Abre ${LOGIN_URL} y pulsa «Aceptar»` +
+  (hasBlob ? "; el token nuevo se guarda solo." : "; después copia el token en SPOTIFY_REFRESH_TOKEN.");
+
 async function getAccessToken() {
-  if (!refreshToken) {
-    throw new Error(`Falta SPOTIFY_REFRESH_TOKEN. Abre ${BASE_URL}/login/<MCP_SECRET> para obtenerlo.`);
-  }
   if (accessToken && Date.now() < accessTokenExpiresAt - 60_000) return accessToken;
+  const token = await loadToken();
+  if (!token?.refresh_token) throw new Error(reloginMessage("No hay sesión de Spotify."));
 
   const res = await fetch("https://accounts.spotify.com/api/token", {
     method: "POST",
     headers: { Authorization: basicAuth(), "Content-Type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({ grant_type: "refresh_token", refresh_token: refreshToken }),
+    body: new URLSearchParams({ grant_type: "refresh_token", refresh_token: token.refresh_token }),
   });
-  if (!res.ok) throw new Error(`Spotify rechazó el refresh token (${res.status}): ${await res.text()}`);
+  if (!res.ok) {
+    const body = await res.text();
+    if (res.status === 400 && body.includes("invalid_grant")) {
+      await clearToken(); // no reintentar: Spotify pide un inicio de sesión nuevo
+      throw new Error(reloginMessage("La sesión de Spotify ha caducado o se ha revocado."));
+    }
+    throw new Error(`Spotify rechazó la renovación del token (${res.status}): ${body}`);
+  }
   const data = await res.json();
   accessToken = data.access_token;
   accessTokenExpiresAt = Date.now() + data.expires_in * 1000;
-  if (data.refresh_token && data.refresh_token !== refreshToken) {
-    refreshToken = data.refresh_token;
-    console.warn("Spotify ha emitido un refresh token nuevo; actualiza SPOTIFY_REFRESH_TOKEN si el servicio se reinicia.");
+  if (data.refresh_token && data.refresh_token !== token.refresh_token) {
+    // Spotify a veces rota el refresh token; se conserva la fecha del inicio de sesión original
+    const saved = await saveToken({ ...token, refresh_token: data.refresh_token });
+    if (!saved) console.warn("Spotify ha emitido un refresh token nuevo y no hay almacén Blob para guardarlo.");
   }
   return accessToken;
+}
+
+// state firmado (sin memoria compartida: funciona en serverless)
+function makeState() {
+  const ts = Date.now().toString(36);
+  const sig = crypto.createHmac("sha256", MCP_SECRET).update(ts).digest("hex").slice(0, 32);
+  return `${ts}.${sig}`;
+}
+function checkState(state) {
+  const [ts, sig] = String(state || "").split(".");
+  if (!ts || !sig) return false;
+  const expected = crypto.createHmac("sha256", MCP_SECRET).update(ts).digest("hex").slice(0, 32);
+  const fresh = Date.now() - parseInt(ts, 36) < 15 * 60_000;
+  return fresh && sig.length === expected.length && crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected));
 }
 
 async function spotify(pathOrUrl) {
@@ -176,6 +251,27 @@ function buildMcpServer() {
     }
   );
 
+  server.registerTool(
+    "auth_status",
+    {
+      title: "Estado de la sesión de Spotify",
+      description: "Indica si hay sesión de Spotify, cuántos días quedan antes de tener que volver a iniciar sesión (caduca cada 6 meses) y el enlace para hacerlo.",
+      inputSchema: {},
+      annotations: { readOnlyHint: true },
+    },
+    async () => {
+      const token = await loadToken();
+      const info = {
+        logged_in: Boolean(token?.refresh_token),
+        obtained_at: token?.obtained_at ?? null,
+        days_left: daysLeft(token),
+        auto_save: hasBlob,
+        login_url: LOGIN_URL,
+      };
+      return { content: [{ type: "text", text: JSON.stringify(info, null, 2) }] };
+    }
+  );
+
   return server;
 }
 
@@ -208,51 +304,60 @@ const methodNotAllowed = (_req, res) =>
 app.get(MCP_PATH, methodNotAllowed);
 app.delete(MCP_PATH, methodNotAllowed);
 
-// Inicio de sesión con Spotify (solo una vez, para obtener el refresh token)
-const pendingStates = new Set();
-
+// Inicio de sesión con Spotify (la primera vez y cada 6 meses)
 app.get(`/login/${MCP_SECRET}`, (_req, res) => {
-  const state = crypto.randomBytes(16).toString("hex");
-  pendingStates.add(state);
   const params = new URLSearchParams({
     response_type: "code",
     client_id: SPOTIFY_CLIENT_ID,
     scope: SCOPES,
     redirect_uri: REDIRECT_URI,
-    state,
+    state: makeState(),
+    show_dialog: "true",
   });
   res.redirect(`https://accounts.spotify.com/authorize?${params}`);
 });
 
+const page = (title, body) => `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${title}</title>
+<body style="font-family:system-ui;max-width:640px;margin:40px auto;padding:0 16px;line-height:1.5"><h1>${title}</h1>${body}</body>`;
+
 app.get("/callback", async (req, res) => {
   const { code, state, error } = req.query;
-  if (error) return res.status(400).send(`Spotify devolvió un error: ${error}`);
-  if (!state || !pendingStates.has(state)) return res.status(400).send("Estado no válido. Vuelve a empezar desde /login.");
-  pendingStates.delete(state);
+  if (error) return res.status(400).type("html").send(page("Error", `<p>Spotify devolvió: ${String(error).replace(/[<>&"]/g, "")}</p>`));
+  if (!checkState(state)) return res.status(400).type("html").send(page("Enlace caducado", "<p>Vuelve a abrir el enlace de inicio de sesión.</p>"));
 
   const tokenRes = await fetch("https://accounts.spotify.com/api/token", {
     method: "POST",
     headers: { Authorization: basicAuth(), "Content-Type": "application/x-www-form-urlencoded" },
     body: new URLSearchParams({ grant_type: "authorization_code", code, redirect_uri: REDIRECT_URI }),
   });
-  if (!tokenRes.ok) return res.status(500).send(`No se pudo canjear el código: ${await tokenRes.text()}`);
+  if (!tokenRes.ok) return res.status(500).type("html").send(page("Error", "<p>No se pudo canjear el código con Spotify. Vuelve a intentarlo.</p>"));
   const data = await tokenRes.json();
-  refreshToken = data.refresh_token;
   accessToken = data.access_token;
   accessTokenExpiresAt = Date.now() + data.expires_in * 1000;
 
-  res.type("html").send(`<!doctype html><meta charset="utf-8"><title>Spotify conectado</title>
-<body style="font-family:system-ui;max-width:640px;margin:40px auto;line-height:1.5">
-<h1>Spotify conectado</h1>
-<p>Copia este valor en la variable de entorno <code>SPOTIFY_REFRESH_TOKEN</code> de tu servicio y reinícialo:</p>
+  const record = { refresh_token: data.refresh_token, obtained_at: new Date().toISOString() };
+  let saved = false;
+  try {
+    saved = await saveToken(record);
+  } catch (err) {
+    console.error("No se pudo guardar el token en Blob:", err);
+  }
+  const renewBy = new Date(Date.now() + TOKEN_LIFETIME_DAYS * DAY).toLocaleDateString("es-ES");
+  if (saved) {
+    return res.type("html").send(page("Spotify conectado", `<p>Token guardado automáticamente. No tienes que copiar nada.</p><p>Spotify pedirá volver a iniciar sesión hacia el <b>${renewBy}</b>.</p>`));
+  }
+  res.type("html").send(page("Spotify conectado", `<p>No hay almacén automático configurado. Copia este valor en la variable <code>SPOTIFY_REFRESH_TOKEN</code> y reinicia el servicio:</p>
 <textarea readonly style="width:100%;height:120px">${data.refresh_token}</textarea>
-<p>No lo compartas con nadie: da acceso de lectura a tus playlists.</p>
-</body>`);
+<p>Spotify pedirá volver a iniciar sesión hacia el <b>${renewBy}</b>. No compartas este valor.</p>`));
 });
 
 app.get("/", (_req, res) => res.type("text").send("OK"));
 
-app.listen(PORT, () => {
-  console.log(`Servidor escuchando en el puerto ${PORT}`);
-  console.log(`URL de callback para Spotify: ${REDIRECT_URI}`);
-});
+if (!process.env.VERCEL) {
+  app.listen(PORT, () => {
+    console.log(`Servidor escuchando en el puerto ${PORT}`);
+    console.log(`URL de callback para Spotify: ${REDIRECT_URI}`);
+  });
+}
+
+export default app;
