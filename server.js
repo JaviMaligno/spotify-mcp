@@ -268,6 +268,20 @@ async function addTracks(value, tracks) {
   return { playlist: id, added: uris.length, uris };
 }
 
+async function removeTracks(value, tracks) {
+  const { id } = await resolvePlaylist(value);
+  const uris = tracks.map((t) => {
+    const m = String(t).match(/track[/:]([A-Za-z0-9]{22})/);
+    if (m) return `spotify:track:${m[1]}`;
+    if (/^[A-Za-z0-9]{22}$/.test(t)) return `spotify:track:${t}`;
+    throw new Error(`No reconozco la canción "${t}". Usa su id, su uri spotify:track:... o su enlace.`);
+  });
+  for (let i = 0; i < uris.length; i += 100) {
+    await spotify(`/playlists/${id}/items`, { method: "DELETE", body: { items: uris.slice(i, i + 100).map((uri) => ({ uri })) } });
+  }
+  return { playlist: id, removed: uris.length, uris };
+}
+
 // ---------- Servidor MCP ----------
 function buildMcpServer() {
   const server = new McpServer({ name: "spotify-playlists", version: "1.0.0" });
@@ -316,6 +330,23 @@ function buildMcpServer() {
     },
     async ({ playlist, tracks }) => {
       const data = await addTracks(playlist, tracks);
+      return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+    }
+  );
+
+  server.registerTool(
+    "remove_tracks",
+    {
+      title: "Quitar canciones de una playlist",
+      description: "Quita canciones de una playlist propia (todas las apariciones de cada una). Acepta ids, uris spotify:track:... o enlaces de canciones.",
+      inputSchema: {
+        playlist: z.string().describe("Nombre exacto, id o enlace de la playlist"),
+        tracks: z.array(z.string()).min(1).describe("Ids, uris o enlaces de las canciones"),
+      },
+      annotations: { readOnlyHint: false, destructiveHint: true },
+    },
+    async ({ playlist, tracks }) => {
+      const data = await removeTracks(playlist, tracks);
       return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
     }
   );
