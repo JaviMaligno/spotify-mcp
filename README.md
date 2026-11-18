@@ -22,7 +22,7 @@ Herramientas que ofrece:
 ## 2. Desplegar en Vercel (recomendado)
 
 1. Importa el repositorio en Vercel. `server.js` exporta la app de Express y Vercel la detecta sin configuración.
-2. En **Storage**, crea un almacén **Blob privado** y conéctalo al proyecto (crea `BLOB_READ_WRITE_TOKEN`).
+2. En **Storage**, crea un almacén **Blob privado** y conéctalo al proyecto (crea `BLOB_STORE_ID`; los almacenes antiguos usan `BLOB_READ_WRITE_TOKEN`). Vuelve a desplegar después de conectarlo.
 3. Variables de entorno: `SPOTIFY_CLIENT_ID`, `SPOTIFY_CLIENT_SECRET`, `MCP_SECRET` (`openssl rand -hex 24`). `PUBLIC_URL` es opcional: por defecto usa el dominio de producción.
 4. Vuelve a desplegar y abre `https://TU-PROYECTO.vercel.app/login/TU_MCP_SECRET`. El token se guarda solo.
 

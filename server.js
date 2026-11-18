@@ -15,7 +15,8 @@ const {
   SPOTIFY_REFRESH_TOKEN, // opcional si hay almacén Blob: el token se guarda solo tras /login
   MCP_SECRET, // cadena larga y aleatoria; forma parte de la URL del conector
   PUBLIC_URL, // URL pública sin barra final; en Vercel se deduce sola
-  BLOB_READ_WRITE_TOKEN, // lo crea Vercel al conectar un almacén Blob al proyecto
+  BLOB_READ_WRITE_TOKEN, // almacenes Blob antiguos o fuera de Vercel
+  BLOB_STORE_ID, // almacenes Blob nuevos conectados al proyecto (autenticación OIDC)
   PORT = 3000,
 } = process.env;
 
@@ -37,7 +38,7 @@ const DAY = 86_400_000;
 // Con Vercel Blob el token se guarda solo (al iniciar sesión y cuando Spotify lo rota).
 // Sin Blob se usa SPOTIFY_REFRESH_TOKEN y la memoria del proceso.
 const BLOB_PATH = "spotify/refresh-token.json";
-const hasBlob = Boolean(BLOB_READ_WRITE_TOKEN);
+const hasBlob = Boolean(BLOB_READ_WRITE_TOKEN || BLOB_STORE_ID);
 let stored; // { refresh_token, obtained_at } | null | undefined (sin leer)
 
 async function loadToken() {
