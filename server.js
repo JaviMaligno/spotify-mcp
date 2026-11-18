@@ -119,12 +119,13 @@ async function getPlaylistTracks(value) {
   const { id } = await resolvePlaylist(value);
   const meta = await spotify(`/playlists/${id}?fields=id,name,owner(display_name),external_urls`);
   const tracks = [];
-  let next = `/playlists/${id}/tracks?limit=100&fields=next,items(added_at,track(id,name,uri,type,artists(name),album(name),external_urls))`;
+  let next = `/playlists/${id}/items?limit=100&fields=next,items(added_at,item(id,name,uri,type,artists(name),album(name),external_urls),track(id,name,uri,type,artists(name),album(name),external_urls))`;
   while (next) {
     const page = await spotify(next);
     for (const item of page.items || []) {
-      const t = item.track;
+      const t = item.item || item.track; // la API de 2026 usa "item"
       if (!t) continue; // canciones eliminadas o no disponibles
+      if (t.type && t.type !== "track") continue; // ignora episodios de podcast
       tracks.push({
         position: tracks.length + 1,
         name: t.name,
