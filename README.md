@@ -45,3 +45,11 @@ Trata esa URL como una contraseña: quien la tenga puede leer tus playlists.
 - Solo pide los permisos `playlist-read-private` y `playlist-read-collaborative`.
 - Nunca subas `.env` ni pegues el Client Secret o el refresh token en chats.
 - Si se filtra algo: regenera el Client Secret en Spotify y cambia `MCP_SECRET`.
+
+
+## Herramientas
+
+- `list_playlists`: lista tus playlists.
+- `get_playlist_tracks`: canciones de una playlist, con ISRC y duración. El parámetro opcional `query` filtra por título, artista o álbum (útil en playlists grandes).
+- `add_tracks`: añade canciones a una playlist propia. Requiere haber iniciado sesión después de añadir los permisos `playlist-modify-public` y `playlist-modify-private`.
+- `auth_status`: estado de la sesión y enlace para volver a iniciarla.

@@ -29,7 +29,7 @@ const vercelUrl = process.env.VERCEL_PROJECT_PRODUCTION_URL && `https://${proces
 const BASE_URL = (PUBLIC_URL || vercelUrl || `http://127.0.0.1:${PORT}`).replace(/\/$/, "");
 const REDIRECT_URI = `${BASE_URL}/callback`;
 const LOGIN_URL = `${BASE_URL}/login/${MCP_SECRET}`;
-const SCOPES = "playlist-read-private playlist-read-collaborative";
+const SCOPES = "playlist-read-private playlist-read-collaborative playlist-modify-public playlist-modify-private";
 const API = "https://api.spotify.com/v1";
 const TOKEN_LIFETIME_DAYS = 180; // Spotify obliga a volver a iniciar sesión cada 6 meses
 const DAY = 86_400_000;
@@ -143,17 +143,23 @@ function checkState(state) {
   return fresh && sig.length === expected.length && crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected));
 }
 
-async function spotify(pathOrUrl) {
+async function spotify(pathOrUrl, { method = "GET", body } = {}) {
   const url = pathOrUrl.startsWith("http") ? pathOrUrl : `${API}${pathOrUrl}`;
   for (let attempt = 0; attempt < 3; attempt++) {
-    const res = await fetch(url, { headers: { Authorization: `Bearer ${await getAccessToken()}` } });
+    const headers = { Authorization: `Bearer ${await getAccessToken()}` };
+    if (body) headers["Content-Type"] = "application/json";
+    const res = await fetch(url, { method, headers, body: body ? JSON.stringify(body) : undefined });
     if (res.status === 429) {
       const wait = Number(res.headers.get("retry-after") || 1);
       await new Promise((r) => setTimeout(r, wait * 1000));
       continue;
     }
+    if (res.status === 403 && method !== "GET") {
+      throw new Error(`Spotify no permite modificar la playlist con la sesión actual (403). Hace falta volver a iniciar sesión para conceder el permiso de edición: ${LOGIN_URL}`);
+    }
     if (!res.ok) throw new Error(`Error de Spotify ${res.status} en ${url}: ${await res.text()}`);
-    return res.json();
+    const text = await res.text();
+    return text ? JSON.parse(text) : {};
   }
   throw new Error("Spotify sigue limitando las peticiones (429). Prueba más tarde.");
 }
@@ -199,31 +205,67 @@ async function resolvePlaylist(value) {
   throw new Error(`No encuentro ninguna playlist llamada "${value}".`);
 }
 
-async function getPlaylistTracks(value) {
+const norm = (x) => String(x || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
+
+async function getPlaylistTracks(value, query) {
   const { id } = await resolvePlaylist(value);
   const meta = await spotify(`/playlists/${id}?fields=id,name,owner(display_name),external_urls`);
+  const F = "total,next,items(added_at,item(id,name,uri,type,duration_ms,external_ids(isrc),artists(name),album(name,release_date),external_urls),track(id,name,uri,type,duration_ms,external_ids(isrc),artists(name),album(name,release_date),external_urls))";
+  const pageUrl = (offset) => `/playlists/${id}/items?limit=100&offset=${offset}&fields=${F}`;
+  const first = await spotify(pageUrl(0));
+  const pages = [first];
+  const offsets = [];
+  for (let o = 100; o < (first.total || 0); o += 100) offsets.push(o);
+  for (let i = 0; i < offsets.length; i += 8) {
+    pages.push(...(await Promise.all(offsets.slice(i, i + 8).map((o) => spotify(pageUrl(o))))));
+  }
   const tracks = [];
-  let next = `/playlists/${id}/items?limit=100&fields=next,items(added_at,item(id,name,uri,type,artists(name),album(name),external_urls),track(id,name,uri,type,artists(name),album(name),external_urls))`;
-  while (next) {
-    const page = await spotify(next);
+  let index = 0;
+  for (const page of pages) {
     for (const item of page.items || []) {
+      index++;
       const t = item.item || item.track; // la API de 2026 usa "item"
       if (!t) continue; // canciones eliminadas o no disponibles
       if (t.type && t.type !== "track") continue; // ignora episodios de podcast
       tracks.push({
-        position: tracks.length + 1,
+        position: index,
         name: t.name,
         artists: (t.artists || []).map((a) => a.name),
         album: t.album?.name,
+        release_date: t.album?.release_date,
+        duration: t.duration_ms ? `${Math.floor(t.duration_ms / 60000)}:${String(Math.round((t.duration_ms % 60000) / 1000)).padStart(2, "0")}` : undefined,
+        isrc: t.external_ids?.isrc,
         added_at: item.added_at,
         id: t.id,
         uri: t.uri,
         url: t.external_urls?.spotify,
       });
     }
-    next = page.next;
   }
-  return { id: meta.id, name: meta.name, owner: meta.owner?.display_name, url: meta.external_urls?.spotify, total: tracks.length, tracks };
+  const total = tracks.length;
+  let out = tracks;
+  if (query) {
+    const words = norm(query).split(/\s+/).filter(Boolean);
+    out = tracks.filter((t) => {
+      const hay = norm([t.name, t.album, ...t.artists].join(" "));
+      return words.every((w) => hay.includes(w));
+    });
+  }
+  return { id: meta.id, name: meta.name, owner: meta.owner?.display_name, url: meta.external_urls?.spotify, total, ...(query ? { query, matches: out.length } : {}), tracks: out };
+}
+
+async function addTracks(value, tracks) {
+  const { id } = await resolvePlaylist(value);
+  const uris = tracks.map((t) => {
+    const m = String(t).match(/track[/:]([A-Za-z0-9]{22})/);
+    if (m) return `spotify:track:${m[1]}`;
+    if (/^[A-Za-z0-9]{22}$/.test(t)) return `spotify:track:${t}`;
+    throw new Error(`No reconozco la canción "${t}". Usa su id, su uri spotify:track:... o su enlace.`);
+  });
+  for (let i = 0; i < uris.length; i += 100) {
+    await spotify(`/playlists/${id}/items`, { method: "POST", body: { uris: uris.slice(i, i + 100) } });
+  }
+  return { playlist: id, added: uris.length, uris };
 }
 
 // ---------- Servidor MCP ----------
@@ -248,14 +290,32 @@ function buildMcpServer() {
     "get_playlist_tracks",
     {
       title: "Canciones de una playlist",
-      description: "Devuelve todas las canciones de una playlist, en orden, con título, artistas, álbum y fecha en que se añadió. Acepta el nombre exacto de la playlist, su id o su enlace.",
+      description: "Devuelve las canciones de una playlist, en orden, con título, artistas, álbum, fecha de salida, duración, ISRC (identifica la grabación) y fecha en que se añadió. Con query solo devuelve las que contienen esas palabras en el título, artista o álbum (sin distinguir mayúsculas ni acentos): úsalo en playlists grandes. Acepta el nombre exacto de la playlist, su id o su enlace.",
       inputSchema: {
         playlist: z.string().describe('Nombre exacto (p. ej. "Bible"), id de 22 caracteres o enlace open.spotify.com/playlist/...'),
+        query: z.string().optional().describe('Palabras a buscar, p. ej. "oceans hillsong". Opcional.'),
       },
       annotations: { readOnlyHint: true },
     },
-    async ({ playlist }) => {
-      const data = await getPlaylistTracks(playlist);
+    async ({ playlist, query }) => {
+      const data = await getPlaylistTracks(playlist, query);
+      return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+    }
+  );
+
+  server.registerTool(
+    "add_tracks",
+    {
+      title: "Añadir canciones a una playlist",
+      description: "Añade canciones al final de una playlist propia. Acepta ids, uris spotify:track:... o enlaces de canciones. Requiere haber iniciado sesión con permiso de edición.",
+      inputSchema: {
+        playlist: z.string().describe("Nombre exacto, id o enlace de la playlist"),
+        tracks: z.array(z.string()).min(1).describe("Ids, uris o enlaces de las canciones"),
+      },
+      annotations: { readOnlyHint: false, destructiveHint: false },
+    },
+    async ({ playlist, tracks }) => {
+      const data = await addTracks(playlist, tracks);
       return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
     }
   );
