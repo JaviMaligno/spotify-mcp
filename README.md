@@ -45,3 +45,6 @@ Trata esa URL como una contraseña: quien la tenga puede leer tus playlists.
 - Solo pide los permisos `playlist-read-private` y `playlist-read-collaborative`.
 - Nunca subas `.env` ni pegues el Client Secret o el refresh token en chats.
 - Si se filtra algo: regenera el Client Secret en Spotify y cambia `MCP_SECRET`.
+- `MCP_SECRET` debe tener al menos 16 caracteres (recomendado: `openssl rand -hex 24`); el servidor no arranca con uno más corto.
+- El enlace de inicio de sesión que muestran las herramientas usa una clave derivada, no `MCP_SECRET`: si acaba en un chat, no sirve para leer tus playlists. Aun así, no lo compartas.
+- La URL del conector queda en los registros de peticiones de la plataforma (Vercel, Render): limita quién tiene acceso al proyecto.

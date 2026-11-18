@@ -21,6 +21,10 @@ const {
 } = process.env;
 
 if (!MCP_SECRET) throw new Error("Falta la variable MCP_SECRET.");
+// La ruta secreta es la única protección: un valor corto se puede adivinar por fuerza bruta.
+if (MCP_SECRET.length < 16) throw new Error("MCP_SECRET es demasiado corto (mínimo 16 caracteres). Genera uno con: openssl rand -hex 24");
+if (MCP_SECRET.length < 32) console.warn("MCP_SECRET tiene menos de 32 caracteres: se recomienda generar uno con `openssl rand -hex 24`.");
+if (!/^[A-Za-z0-9._~-]+$/.test(MCP_SECRET)) console.warn("MCP_SECRET contiene caracteres que hay que codificar en la URL: mejor usa solo letras, números, guiones y puntos.");
 if (!SPOTIFY_CLIENT_ID || !SPOTIFY_CLIENT_SECRET) {
   console.warn("Faltan SPOTIFY_CLIENT_ID y/o SPOTIFY_CLIENT_SECRET: el servidor arranca, pero no podrá hablar con Spotify hasta que las añadas.");
 }
@@ -28,7 +32,15 @@ if (!SPOTIFY_CLIENT_ID || !SPOTIFY_CLIENT_SECRET) {
 const vercelUrl = process.env.VERCEL_PROJECT_PRODUCTION_URL && `https://${process.env.VERCEL_PROJECT_PRODUCTION_URL}`;
 const BASE_URL = (PUBLIC_URL || vercelUrl || `http://127.0.0.1:${PORT}`).replace(/\/$/, "");
 const REDIRECT_URI = `${BASE_URL}/callback`;
-const LOGIN_URL = `${BASE_URL}/login/${MCP_SECRET}`;
+// Claves derivadas: el enlace de inicio de sesión aparece en las respuestas de las herramientas
+// (y por tanto en los chats), así que no debe contener MCP_SECRET ni servir para leer playlists.
+const derive = (purpose) => crypto.createHmac("sha256", MCP_SECRET).update(purpose).digest("hex");
+const LOGIN_KEY = derive("login-url").slice(0, 48);
+const STATE_KEY = derive("oauth-state");
+const LOGIN_URL = `${BASE_URL}/login/${LOGIN_KEY}`;
+// Comparación en tiempo constante (se comparan los hashes para no filtrar la longitud)
+const sha256 = (v) => crypto.createHash("sha256").update(String(v)).digest();
+const safeEqual = (a, b) => crypto.timingSafeEqual(sha256(a), sha256(b));
 const SCOPES = "playlist-read-private playlist-read-collaborative";
 const API = "https://api.spotify.com/v1";
 const TOKEN_LIFETIME_DAYS = 180; // Spotify obliga a volver a iniciar sesión cada 6 meses
@@ -132,23 +144,26 @@ async function getAccessToken() {
 // state firmado (sin memoria compartida: funciona en serverless)
 function makeState() {
   const ts = Date.now().toString(36);
-  const sig = crypto.createHmac("sha256", MCP_SECRET).update(ts).digest("hex").slice(0, 32);
+  const sig = crypto.createHmac("sha256", STATE_KEY).update(ts).digest("hex").slice(0, 32);
   return `${ts}.${sig}`;
 }
 function checkState(state) {
   const [ts, sig] = String(state || "").split(".");
   if (!ts || !sig) return false;
-  const expected = crypto.createHmac("sha256", MCP_SECRET).update(ts).digest("hex").slice(0, 32);
-  const fresh = Date.now() - parseInt(ts, 36) < 15 * 60_000;
+  const expected = crypto.createHmac("sha256", STATE_KEY).update(ts).digest("hex").slice(0, 32);
+  const age = Date.now() - parseInt(ts, 36);
+  const fresh = age >= 0 && age < 15 * 60_000;
   return fresh && sig.length === expected.length && crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected));
 }
 
 async function spotify(pathOrUrl) {
   const url = pathOrUrl.startsWith("http") ? pathOrUrl : `${API}${pathOrUrl}`;
+  // El token de acceso solo viaja a la API de Spotify, aunque un enlace "next" apunte a otro sitio
+  if (new URL(url).origin !== new URL(API).origin) throw new Error("URL fuera de la API de Spotify.");
   for (let attempt = 0; attempt < 3; attempt++) {
     const res = await fetch(url, { headers: { Authorization: `Bearer ${await getAccessToken()}` } });
     if (res.status === 429) {
-      const wait = Number(res.headers.get("retry-after") || 1);
+      const wait = Math.min(Number(res.headers.get("retry-after")) || 1, 10); // tope: no dejar la petición colgada
       await new Promise((r) => setTimeout(r, wait * 1000));
       continue;
     }
@@ -286,11 +301,26 @@ function buildMcpServer() {
 
 // ---------- HTTP ----------
 const app = express();
+app.disable("x-powered-by");
+app.use((_req, res, next) => {
+  res.set({
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy": "no-referrer",
+    "X-Frame-Options": "DENY",
+    "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'",
+  });
+  next();
+});
 app.use(express.json({ limit: "1mb" }));
 
-const MCP_PATH = `/mcp/${MCP_SECRET}`;
+// El secreto se compara como parámetro (no se incrusta en el patrón de la ruta): así caracteres
+// como ":" o "*" no se interpretan como comodines, y la comparación es en tiempo constante.
+const MCP_PATH = "/mcp/:key";
+const notFound = (res) => res.status(404).type("text").send("Not found");
+const requireKey = (...valid) => (req, res, next) =>
+  valid.some((k) => safeEqual(req.params.key, k)) ? next() : notFound(res);
 
-app.post(MCP_PATH, async (req, res) => {
+app.post(MCP_PATH, requireKey(MCP_SECRET), async (req, res) => {
   const server = buildMcpServer();
   const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined }); // sin estado
   res.on("close", () => {
@@ -310,11 +340,14 @@ app.post(MCP_PATH, async (req, res) => {
 
 const methodNotAllowed = (_req, res) =>
   res.status(405).json({ jsonrpc: "2.0", error: { code: -32000, message: "Método no permitido" }, id: null });
-app.get(MCP_PATH, methodNotAllowed);
-app.delete(MCP_PATH, methodNotAllowed);
+app.get(MCP_PATH, requireKey(MCP_SECRET), methodNotAllowed);
+app.delete(MCP_PATH, requireKey(MCP_SECRET), methodNotAllowed);
 
 // Inicio de sesión con Spotify (la primera vez y cada 6 meses)
-app.get(`/login/${MCP_SECRET}`, (_req, res) => {
+// Acepta la clave derivada (la que muestran las herramientas) y también MCP_SECRET (primer uso)
+app.get("/login/:key", requireKey(LOGIN_KEY, MCP_SECRET), (_req, res) => {
+  res.set("Cache-Control", "no-store");
+  if (!SPOTIFY_CLIENT_ID) return res.status(500).type("text").send("Falta SPOTIFY_CLIENT_ID.");
   const params = new URLSearchParams({
     response_type: "code",
     client_id: SPOTIFY_CLIENT_ID,
@@ -326,20 +359,22 @@ app.get(`/login/${MCP_SECRET}`, (_req, res) => {
   res.redirect(`https://accounts.spotify.com/authorize?${params}`);
 });
 
+const esc = (v) => String(v).replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
 const page = (title, body) => `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${title}</title>
 <body style="font-family:system-ui;max-width:640px;margin:40px auto;padding:0 16px;line-height:1.5"><h1>${title}</h1>${body}</body>`;
 
 app.get("/callback", async (req, res) => {
+  res.set("Cache-Control", "no-store"); // la página puede mostrar el refresh token
   const { code, state, error } = req.query;
-  if (error) return res.status(400).type("html").send(page("Error", `<p>Spotify devolvió: ${String(error).replace(/[<>&"]/g, "")}</p>`));
-  if (!checkState(state)) return res.status(400).type("html").send(page("Enlace caducado", "<p>Vuelve a abrir el enlace de inicio de sesión.</p>"));
+  if (error) return res.status(400).type("html").send(page("Error", `<p>Spotify devolvió: ${esc(String(error).slice(0, 200))}</p>`));
+  if (typeof code !== "string" || !checkState(state)) return res.status(400).type("html").send(page("Enlace caducado", "<p>Vuelve a abrir el enlace de inicio de sesión.</p>"));
 
   const tokenRes = await fetch("https://accounts.spotify.com/api/token", {
     method: "POST",
     headers: { Authorization: basicAuth(), "Content-Type": "application/x-www-form-urlencoded" },
     body: new URLSearchParams({ grant_type: "authorization_code", code, redirect_uri: REDIRECT_URI }),
-  });
-  if (!tokenRes.ok) return res.status(500).type("html").send(page("Error", "<p>No se pudo canjear el código con Spotify. Vuelve a intentarlo.</p>"));
+  }).catch(() => null);
+  if (!tokenRes?.ok) return res.status(500).type("html").send(page("Error", "<p>No se pudo canjear el código con Spotify. Vuelve a intentarlo.</p>"));
   const data = await tokenRes.json();
   accessToken = data.access_token;
   accessTokenExpiresAt = Date.now() + data.expires_in * 1000;
@@ -358,10 +393,10 @@ app.get("/callback", async (req, res) => {
     return res.type("html").send(page("Spotify conectado", `<p>Token guardado automáticamente. No tienes que copiar nada.</p><p>Spotify pedirá volver a iniciar sesión hacia el <b>${renewBy}</b>.</p>`));
   }
   const why = blobError
-    ? `<p><b>El almacén Blob está configurado pero falló al guardar:</b> <code>${blobError.replace(/[<>&"]/g, "")}</code></p>`
-    : `<p>No hay almacén automático configurado (falta <code>BLOB_STORE_ID</code> o <code>BLOB_READ_WRITE_TOKEN</code>). Variables relacionadas visibles: <code>${Object.keys(process.env).filter((k) => /BLOB|STORE/i.test(k)).join(", ") || "ninguna"}</code>. Entorno: <code>${process.env.VERCEL_ENV || "local"}</code>.</p>`;
+    ? `<p><b>El almacén Blob está configurado pero falló al guardar:</b> <code>${esc(blobError)}</code></p>`
+    : `<p>No hay almacén automático configurado (falta <code>BLOB_STORE_ID</code> o <code>BLOB_READ_WRITE_TOKEN</code>).</p>`;
   res.type("html").send(page("Spotify conectado", `${why}<p>Mientras tanto, puedes copiar este valor en la variable <code>SPOTIFY_REFRESH_TOKEN</code> y volver a desplegar:</p>
-<textarea readonly style="width:100%;height:120px">${data.refresh_token}</textarea>
+<textarea readonly style="width:100%;height:120px">${esc(data.refresh_token)}</textarea>
 <p>Spotify pedirá volver a iniciar sesión hacia el <b>${renewBy}</b>. No compartas este valor.</p>`));
 });
 
