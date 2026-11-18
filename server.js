@@ -16,9 +16,12 @@ const {
   PORT = 3000,
 } = process.env;
 
-if (!SPOTIFY_CLIENT_ID || !SPOTIFY_CLIENT_SECRET || !MCP_SECRET) {
-  console.error("Faltan variables: SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET y MCP_SECRET son obligatorias.");
+if (!MCP_SECRET) {
+  console.error("Falta la variable MCP_SECRET.");
   process.exit(1);
+}
+if (!SPOTIFY_CLIENT_ID || !SPOTIFY_CLIENT_SECRET) {
+  console.warn("Faltan SPOTIFY_CLIENT_ID y/o SPOTIFY_CLIENT_SECRET: el servidor arranca, pero no podrá hablar con Spotify hasta que las añadas.");
 }
 
 const BASE_URL = (PUBLIC_URL || `http://127.0.0.1:${PORT}`).replace(/\/$/, "");
