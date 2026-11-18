@@ -338,16 +338,21 @@ app.get("/callback", async (req, res) => {
 
   const record = { refresh_token: data.refresh_token, obtained_at: new Date().toISOString() };
   let saved = false;
+  let blobError = null;
   try {
     saved = await saveToken(record);
   } catch (err) {
+    blobError = err?.message || String(err);
     console.error("No se pudo guardar el token en Blob:", err);
   }
   const renewBy = new Date(Date.now() + TOKEN_LIFETIME_DAYS * DAY).toLocaleDateString("es-ES");
   if (saved) {
     return res.type("html").send(page("Spotify conectado", `<p>Token guardado automáticamente. No tienes que copiar nada.</p><p>Spotify pedirá volver a iniciar sesión hacia el <b>${renewBy}</b>.</p>`));
   }
-  res.type("html").send(page("Spotify conectado", `<p>No hay almacén automático configurado. Copia este valor en la variable <code>SPOTIFY_REFRESH_TOKEN</code> y reinicia el servicio:</p>
+  const why = blobError
+    ? `<p><b>El almacén Blob está configurado pero falló al guardar:</b> <code>${blobError.replace(/[<>&"]/g, "")}</code></p>`
+    : "<p>No hay almacén automático configurado (falta <code>BLOB_STORE_ID</code> o <code>BLOB_READ_WRITE_TOKEN</code>).</p>";
+  res.type("html").send(page("Spotify conectado", `${why}<p>Mientras tanto, puedes copiar este valor en la variable <code>SPOTIFY_REFRESH_TOKEN</code> y volver a desplegar:</p>
 <textarea readonly style="width:100%;height:120px">${data.refresh_token}</textarea>
 <p>Spotify pedirá volver a iniciar sesión hacia el <b>${renewBy}</b>. No compartas este valor.</p>`));
 });
