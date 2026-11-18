@@ -38,7 +38,14 @@ const DAY = 86_400_000;
 // Con Vercel Blob el token se guarda solo (al iniciar sesión y cuando Spotify lo rota).
 // Sin Blob se usa SPOTIFY_REFRESH_TOKEN y la memoria del proceso.
 const BLOB_PATH = "spotify/refresh-token.json";
-const hasBlob = Boolean(BLOB_READ_WRITE_TOKEN || BLOB_STORE_ID);
+// Vercel permite un prefijo al conectar el almacén (p. ej. MI_BLOB_READ_WRITE_TOKEN): se aceptan ambos
+const findEnv = (suffix) =>
+  Object.entries(process.env).find(([k, v]) => v && (k === suffix || k.endsWith(`_${suffix}`)));
+const rwTokenEnv = BLOB_READ_WRITE_TOKEN ? ["BLOB_READ_WRITE_TOKEN", BLOB_READ_WRITE_TOKEN] : findEnv("BLOB_READ_WRITE_TOKEN");
+const storeIdEnv = BLOB_STORE_ID ? ["BLOB_STORE_ID", BLOB_STORE_ID] : findEnv("BLOB_STORE_ID");
+const blobAuth = rwTokenEnv ? { token: rwTokenEnv[1] } : storeIdEnv ? { storeId: storeIdEnv[1] } : {};
+const hasBlob = Boolean(rwTokenEnv || storeIdEnv);
+console.log(`Almacén Blob: ${hasBlob ? (rwTokenEnv?.[0] || storeIdEnv?.[0]) : "no configurado"}`);
 let stored; // { refresh_token, obtained_at } | null | undefined (sin leer)
 
 async function loadToken() {
@@ -46,7 +53,7 @@ async function loadToken() {
   stored = null;
   if (hasBlob) {
     try {
-      const res = await getBlob(BLOB_PATH, { access: "private" });
+      const res = await getBlob(BLOB_PATH, { access: "private", ...blobAuth });
       if (res?.statusCode === 200) stored = JSON.parse(await new Response(res.stream).text());
     } catch (err) {
       console.warn("No se pudo leer el token del almacén Blob:", err.message);
@@ -63,6 +70,7 @@ async function saveToken(data) {
   if (!hasBlob) return false;
   await put(BLOB_PATH, JSON.stringify(data), {
     access: "private",
+    ...blobAuth,
     contentType: "application/json",
     allowOverwrite: true,
     addRandomSuffix: false,
@@ -351,7 +359,7 @@ app.get("/callback", async (req, res) => {
   }
   const why = blobError
     ? `<p><b>El almacén Blob está configurado pero falló al guardar:</b> <code>${blobError.replace(/[<>&"]/g, "")}</code></p>`
-    : "<p>No hay almacén automático configurado (falta <code>BLOB_STORE_ID</code> o <code>BLOB_READ_WRITE_TOKEN</code>).</p>";
+    : `<p>No hay almacén automático configurado (falta <code>BLOB_STORE_ID</code> o <code>BLOB_READ_WRITE_TOKEN</code>). Variables relacionadas visibles: <code>${Object.keys(process.env).filter((k) => /BLOB|STORE/i.test(k)).join(", ") || "ninguna"}</code>. Entorno: <code>${process.env.VERCEL_ENV || "local"}</code>.</p>`;
   res.type("html").send(page("Spotify conectado", `${why}<p>Mientras tanto, puedes copiar este valor en la variable <code>SPOTIFY_REFRESH_TOKEN</code> y volver a desplegar:</p>
 <textarea readonly style="width:100%;height:120px">${data.refresh_token}</textarea>
 <p>Spotify pedirá volver a iniciar sesión hacia el <b>${renewBy}</b>. No compartas este valor.</p>`));
