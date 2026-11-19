@@ -51,6 +51,7 @@ Trata esa URL como una contraseña: quien la tenga puede leer tus playlists.
 
 - `list_playlists`: lista tus playlists.
 - `get_playlist_tracks`: canciones de una playlist, con ISRC y duración. El parámetro opcional `query` filtra por título, artista o álbum (útil en playlists grandes).
+- `search_tracks`: busca canciones en el catálogo de Spotify.
 - `add_tracks`: añade canciones a una playlist propia. Requiere haber iniciado sesión después de añadir los permisos `playlist-modify-public` y `playlist-modify-private`.
 - `remove_tracks`: quita canciones de una playlist propia (mismo permiso que `add_tracks`).
 - `auth_status`: estado de la sesión y enlace para volver a iniciarla.

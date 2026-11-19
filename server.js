@@ -268,6 +268,22 @@ async function addTracks(value, tracks) {
   return { playlist: id, added: uris.length, uris };
 }
 
+async function searchTracks(query, limit = 10) {
+  const n = Math.max(1, Math.min(10, limit));
+  const data = await spotify(`/search?type=track&limit=${n}&q=${encodeURIComponent(query)}`);
+  return (data.tracks?.items || []).map((t) => ({
+    name: t.name,
+    artists: (t.artists || []).map((a) => a.name),
+    album: t.album?.name,
+    release_date: t.album?.release_date,
+    duration: t.duration_ms ? `${Math.floor(t.duration_ms / 60000)}:${String(Math.round((t.duration_ms % 60000) / 1000)).padStart(2, "0")}` : undefined,
+    isrc: t.external_ids?.isrc,
+    id: t.id,
+    uri: t.uri,
+    url: t.external_urls?.spotify,
+  }));
+}
+
 async function removeTracks(value, tracks) {
   const { id } = await resolvePlaylist(value);
   const uris = tracks.map((t) => {
@@ -330,6 +346,23 @@ function buildMcpServer() {
     },
     async ({ playlist, tracks }) => {
       const data = await addTracks(playlist, tracks);
+      return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+    }
+  );
+
+  server.registerTool(
+    "search_tracks",
+    {
+      title: "Buscar canciones en Spotify",
+      description: "Busca canciones en el catálogo de Spotify. Admite la sintaxis de Spotify, p. ej. 'track:\"Skin & Bones\" artist:\"Fit For A King\"' o 'album:\"Descendants\"'. Devuelve título, artistas, álbum, fecha, duración, ISRC e id.",
+      inputSchema: {
+        query: z.string().describe("Texto de búsqueda"),
+        limit: z.number().int().min(1).max(10).optional().describe("Resultados (máx. 10)"),
+      },
+      annotations: { readOnlyHint: true },
+    },
+    async ({ query, limit }) => {
+      const data = await searchTracks(query, limit);
       return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
     }
   );
