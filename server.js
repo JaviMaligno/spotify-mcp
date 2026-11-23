@@ -322,8 +322,8 @@ async function fetchAllPages(pageUrl, pageSize) {
   const pages = [first];
   const offsets = [];
   for (let o = pageSize; o < (first.total || 0); o += pageSize) offsets.push(o);
-  for (let i = 0; i < offsets.length; i += 8) {
-    pages.push(...(await Promise.all(offsets.slice(i, i + 8).map((o) => spotify(pageUrl(o))))));
+  for (let i = 0; i < offsets.length; i += 4) {
+    pages.push(...(await Promise.all(offsets.slice(i, i + 4).map((o) => spotify(pageUrl(o))))));
   }
   return pages;
 }
@@ -421,21 +421,10 @@ async function removeTracks(value, tracks) {
 }
 
 // ---------- «Me gusta» (canciones guardadas) ----------
-async function getSavedTracks(query, opts = {}) {
-  const { limit, offset = 0, brief } = opts;
-  const pageUrl = (o) => `/me/tracks?limit=50&offset=${o}`;
-  // Sin query y con limit basta con descargar las páginas pedidas
-  const partial = !query && !hasFilters(opts) && limit;
-  let pages;
-  let first = 0;
-  if (partial) {
-    first = Math.floor(offset / 50) * 50;
-    const offsets = [];
-    for (let o = first; o < offset + limit; o += 50) offsets.push(o);
-    pages = await Promise.all(offsets.map((o) => spotify(pageUrl(o))));
-  } else {
-    pages = await fetchAllPages(pageUrl, 50);
-  }
+const SAVED_CACHE = "spotify/saved-cache.json";
+let savedMem; // { sig, tracks }
+
+function parseSaved(pages) {
   const tracks = [];
   for (const page of pages) {
     for (const item of page.items || []) {
@@ -444,6 +433,49 @@ async function getSavedTracks(query, opts = {}) {
       const { id, url, ...rest } = formatTrack(t);
       tracks.push({ ...rest, added_at: item.added_at, id, url });
     }
+  }
+  return tracks;
+}
+
+// «Me gusta» completa con caché: una sola petición comprueba si ha cambiado (total y última canción guardada)
+// y solo entonces se vuelven a bajar todas las páginas. Evita que Spotify limite /me/tracks por uso repetido.
+async function loadAllSaved() {
+  const pageUrl = (o) => `/me/tracks?limit=50&offset=${o}`;
+  const head = await spotify(pageUrl(0));
+  const top = head.items?.[0];
+  const sig = `${head.total}|${top?.added_at}|${(top?.item || top?.track)?.id}`;
+  if (savedMem?.sig !== sig && hasBlob) {
+    const cached = await readJson(SAVED_CACHE).catch(() => null);
+    if (cached?.sig === sig) savedMem = cached;
+  }
+  if (savedMem?.sig === sig) return savedMem.tracks;
+  const pages = [head];
+  const offsets = [];
+  for (let o = 50; o < (head.total || 0); o += 50) offsets.push(o);
+  for (let i = 0; i < offsets.length; i += 4) {
+    pages.push(...(await Promise.all(offsets.slice(i, i + 4).map((o) => spotify(pageUrl(o))))));
+  }
+  savedMem = { sig, tracks: parseSaved(pages) };
+  if (hasBlob) await writeJson(SAVED_CACHE, savedMem).catch((err) => console.warn("No se pudo guardar la caché de «Me gusta»:", err.message));
+  return savedMem.tracks;
+}
+
+async function getSavedTracks(query, opts = {}) {
+  const { limit, offset = 0, brief } = opts;
+  const pageUrl = (o) => `/me/tracks?limit=50&offset=${o}`;
+  // Sin query y con limit basta con descargar las páginas pedidas
+  const partial = !query && !hasFilters(opts) && limit;
+  let pages = [];
+  let first = 0;
+  let tracks;
+  if (partial) {
+    first = Math.floor(offset / 50) * 50;
+    const offsets = [];
+    for (let o = first; o < offset + limit; o += 50) offsets.push(o);
+    pages = await Promise.all(offsets.map((o) => spotify(pageUrl(o))));
+    tracks = parseSaved(pages);
+  } else {
+    tracks = await loadAllSaved();
   }
   const out = await applyFilters(filterTracks(tracks, query), opts);
   const total = partial ? pages[0]?.total ?? tracks.length : tracks.length;
