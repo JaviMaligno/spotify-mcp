@@ -63,6 +63,7 @@ Spotify solo devuelve las últimas 50 reproducciones, así que el servidor las v
 | `save_tracks` / `unsave_tracks` | Añade o quita canciones de «Me gusta» (usa `/me/library`, la API de febrero de 2026). |
 | `get_top_items` | Ranking de canciones o artistas más escuchados en ~4 semanas, ~6 meses o ~1 año. |
 | `get_recently_played` | Tus últimas 50 reproducciones. |
+| *(filtros)* | En `get_playlist_tracks`, `get_saved_tracks` y `get_top_items`: `not_in` / `also_in` cruzan con otra playlist o con `me_gusta` por ISRC (`matches` da el tamaño); `duplicates` deja solo las grabaciones repetidas. |
 | `get_play_log` | Registro acumulado de escuchas: resumen por canción (veces, días, última vez, desde qué playlist) o lista cronológica con `detail`. Necesita Blob. |
 | `find_in_playlists` | En qué playlists propias está cada canción, comparando por ISRC. Indexa las playlists en Blob y solo vuelve a descargar las que cambian. |
 | `auth_status` | Estado de la sesión y enlace para volver a iniciarla. |
