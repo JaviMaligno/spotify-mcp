@@ -659,17 +659,21 @@ async function findInPlaylists({ tracks = [], playlist } = {}) {
 }
 
 // ---------- Servidor MCP ----------
+// Algunos clientes envían los booleanos como texto ("true"/"false") cuando aún no conocen el parámetro
+const bool = (description) =>
+  z.preprocess((v) => (v === "true" ? true : v === "false" ? false : v), z.boolean().optional()).describe(description);
+
 const PAGING = {
   limit: z.number().int().min(1).optional().describe("Máximo de canciones a devolver. Por defecto, todas."),
   offset: z.number().int().min(0).optional().describe("Cuántas saltar desde el principio (para paginar). Por defecto 0."),
-  brief: z.boolean().optional().describe("true = una línea por canción («id isrc fecha Artistas — Título»). Recomendado en listas grandes."),
+  brief: bool("true = una línea por canción («id isrc fecha Artistas — Título»). Recomendado en listas grandes."),
 };
 
 const SETS = {
   not_in: z.string().optional().describe('Solo las canciones que NO están en esta otra lista: nombre, id o enlace de una playlist, o "me_gusta". Compara por ISRC.'),
   also_in: z.string().optional().describe('Solo las canciones que TAMBIÉN están en esta otra lista (playlist o "me_gusta"). Compara por ISRC.'),
 };
-const DUPLICATES = z.boolean().optional().describe("true = solo las grabaciones repetidas (mismo ISRC), agrupadas y con la más antigua primero.");
+const DUPLICATES = bool("true = solo las grabaciones repetidas (mismo ISRC), agrupadas y con la más antigua primero.");
 
 function buildMcpServer() {
   const server = new McpServer({ name: "spotify-playlists", version: "1.3.0" });
@@ -831,7 +835,7 @@ function buildMcpServer() {
       inputSchema: {
         since: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().describe("Fecha inicial AAAA-MM-DD (UTC). Por defecto, hace 30 días."),
         until: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().describe("Fecha final AAAA-MM-DD (UTC), incluida. Por defecto, hoy."),
-        detail: z.boolean().optional().describe("true = lista cronológica de reproducciones en vez del resumen por canción."),
+        detail: bool("true = lista cronológica de reproducciones en vez del resumen por canción."),
         limit: z.number().int().min(1).max(2000).optional().describe("Máximo de filas (por defecto 200: las más escuchadas, o las más recientes con detail)."),
       },
       annotations: { readOnlyHint: true },
