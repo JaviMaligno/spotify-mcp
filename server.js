@@ -177,13 +177,17 @@ function checkState(state) {
 
 async function spotify(pathOrUrl, { method = "GET", body } = {}) {
   const url = pathOrUrl.startsWith("http") ? pathOrUrl : `${API}${pathOrUrl}`;
-  for (let attempt = 0; attempt < 3; attempt++) {
+  for (let attempt = 0; attempt < 4; attempt++) {
     const headers = { Authorization: `Bearer ${await getAccessToken()}` };
     if (body) headers["Content-Type"] = "application/json";
     const res = await fetch(url, { method, headers, body: body ? JSON.stringify(body) : undefined });
     if (res.status === 429) {
       const wait = Number(res.headers.get("retry-after") || 1);
       await new Promise((r) => setTimeout(r, wait * 1000));
+      continue;
+    }
+    if (res.status >= 500 && method === "GET" && attempt < 3) {
+      await new Promise((r) => setTimeout(r, 400 * 2 ** attempt)); // fallos pasajeros de Spotify (502/503/504)
       continue;
     }
     if (res.status === 403) {
@@ -259,6 +263,45 @@ function filterTracks(tracks, query) {
   });
 }
 
+// ---------- Filtros de conjuntos ----------
+// Una «lista» es una playlist (nombre, id o enlace) o «Me gusta» (me_gusta).
+const LIKED_RE = /^(me[ _]?gusta|liked|saved)$/i;
+const isrcKey = (t) => t.isrc?.toUpperCase();
+
+async function listKeys(spec) {
+  const data = LIKED_RE.test(spec.trim()) ? await getSavedTracks() : await getPlaylistTracks(spec);
+  return { isrcs: new Set(data.tracks.map(isrcKey).filter(Boolean)), ids: new Set(data.tracks.map((t) => t.id)) };
+}
+
+// not_in / also_in comparan por ISRC (misma grabación aunque cambie el id) y, si falta, por id.
+// duplicates deja solo las grabaciones que aparecen más de una vez, agrupadas.
+async function applyFilters(tracks, { not_in, also_in, duplicates } = {}) {
+  let out = tracks;
+  for (const [spec, keep] of [[not_in, false], [also_in, true]]) {
+    if (!spec) continue;
+    const keys = await listKeys(spec);
+    out = out.filter((t) => (keys.isrcs.has(isrcKey(t)) || keys.ids.has(t.id)) === keep);
+  }
+  if (duplicates) {
+    const groups = new Map();
+    for (const t of out) {
+      const k = isrcKey(t) || t.id;
+      if (!groups.has(k)) groups.set(k, []);
+      groups.get(k).push(t);
+    }
+    out = [...groups.values()]
+      .filter((g) => g.length > 1)
+      .flatMap((g) => g.sort((a, b) => String(a.added_at).localeCompare(String(b.added_at)))); // la más antigua primero
+  }
+  return out;
+}
+const hasFilters = (o = {}) => Boolean(o.not_in || o.also_in || o.duplicates);
+const filterInfo = (o = {}) => ({
+  ...(o.not_in ? { not_in: o.not_in } : {}),
+  ...(o.also_in ? { also_in: o.also_in } : {}),
+  ...(o.duplicates ? { duplicates: true } : {}),
+});
+
 // Descarga en paralelo todas las páginas de un listado con limit/offset
 async function fetchAllPages(pageUrl, pageSize) {
   const first = await spotify(pageUrl(0));
@@ -332,8 +375,9 @@ async function getPlaylistTracks(value, query, opts) {
     }
   }
   const total = tracks.length;
-  const out = filterTracks(tracks, query);
-  return { id: meta.id, name: meta.name, owner: meta.owner?.display_name, url: meta.external_urls?.spotify, total, ...(query ? { query, matches: out.length } : {}), ...shape(out, opts) };
+  const out = await applyFilters(filterTracks(tracks, query), opts);
+  const filtered = query || hasFilters(opts);
+  return { id: meta.id, name: meta.name, owner: meta.owner?.display_name, url: meta.external_urls?.spotify, total, ...(query ? { query } : {}), ...filterInfo(opts), ...(filtered ? { matches: out.length } : {}), ...shape(out, opts) };
 }
 
 async function addTracks(value, tracks, position) {
@@ -363,10 +407,11 @@ async function removeTracks(value, tracks) {
 }
 
 // ---------- «Me gusta» (canciones guardadas) ----------
-async function getSavedTracks(query, { limit, offset = 0, brief } = {}) {
+async function getSavedTracks(query, opts = {}) {
+  const { limit, offset = 0, brief } = opts;
   const pageUrl = (o) => `/me/tracks?limit=50&offset=${o}`;
   // Sin query y con limit basta con descargar las páginas pedidas
-  const partial = !query && limit;
+  const partial = !query && !hasFilters(opts) && limit;
   let pages;
   let first = 0;
   if (partial) {
@@ -386,10 +431,11 @@ async function getSavedTracks(query, { limit, offset = 0, brief } = {}) {
       tracks.push({ ...rest, added_at: item.added_at, id, url });
     }
   }
-  const out = filterTracks(tracks, query);
+  const out = await applyFilters(filterTracks(tracks, query), opts);
   const total = partial ? pages[0]?.total ?? tracks.length : tracks.length;
   const shaped = shape(out, { limit, offset: partial ? offset - first : offset, brief });
-  return { total, ...(query ? { query, matches: out.length } : {}), ...shaped, ...(limit || offset ? { offset } : {}) };
+  const filtered = query || hasFilters(opts);
+  return { total, ...(query ? { query } : {}), ...filterInfo(opts), ...(filtered ? { matches: out.length } : {}), ...shaped, ...(limit || offset ? { offset } : {}) };
 }
 
 // Desde febrero de 2026 guardar y quitar usan /me/library con uris (máx. 40 por petición)
@@ -404,7 +450,7 @@ async function changeLibrary(tracks, method) {
 // ---------- Actividad de escucha ----------
 const TIME_RANGES = { short_term: "~4 semanas", medium_term: "~6 meses", long_term: "~1 año" };
 
-async function getTop(type, timeRange = "medium_term", limit = 50, brief = false) {
+async function getTop(type, timeRange = "medium_term", limit = 50, brief = false, filters = {}) {
   const items = [];
   let next = `/me/top/${type}?time_range=${timeRange}&limit=50`;
   while (next && items.length < limit) {
@@ -412,12 +458,15 @@ async function getTop(type, timeRange = "medium_term", limit = 50, brief = false
     items.push(...(page.items || []));
     next = page.next;
   }
-  const list = items.slice(0, limit).map((x, i) =>
+  let list = items.slice(0, limit).map((x, i) =>
     type === "tracks"
       ? { rank: i + 1, ...formatTrack(x) }
       : { rank: i + 1, name: x.name, genres: x.genres, id: x.id, url: x.external_urls?.spotify }
   );
-  return { type, time_range: timeRange, period: TIME_RANGES[timeRange], total: list.length, items: brief && type === "tracks" ? list.map(briefTrack) : list };
+  const total = list.length;
+  const filtered = type === "tracks" && hasFilters(filters);
+  if (filtered) list = await applyFilters(list, { not_in: filters.not_in, also_in: filters.also_in });
+  return { type, time_range: timeRange, period: TIME_RANGES[timeRange], total, ...(filtered ? { ...filterInfo({ ...filters, duplicates: false }), matches: list.length } : {}), items: brief && type === "tracks" ? list.map(briefTrack) : list };
 }
 
 async function getRecentlyPlayed() {
@@ -616,8 +665,14 @@ const PAGING = {
   brief: z.boolean().optional().describe("true = una línea por canción («id isrc fecha Artistas — Título»). Recomendado en listas grandes."),
 };
 
+const SETS = {
+  not_in: z.string().optional().describe('Solo las canciones que NO están en esta otra lista: nombre, id o enlace de una playlist, o "me_gusta". Compara por ISRC.'),
+  also_in: z.string().optional().describe('Solo las canciones que TAMBIÉN están en esta otra lista (playlist o "me_gusta"). Compara por ISRC.'),
+};
+const DUPLICATES = z.boolean().optional().describe("true = solo las grabaciones repetidas (mismo ISRC), agrupadas y con la más antigua primero.");
+
 function buildMcpServer() {
-  const server = new McpServer({ name: "spotify-playlists", version: "1.2.0" });
+  const server = new McpServer({ name: "spotify-playlists", version: "1.3.0" });
 
   server.registerTool(
     "list_playlists",
@@ -637,16 +692,18 @@ function buildMcpServer() {
     "get_playlist_tracks",
     {
       title: "Canciones de una playlist",
-      description: "Devuelve las canciones de una playlist, en orden, con título, artistas, álbum, fecha de salida, duración, ISRC (identifica la grabación) y fecha en que se añadió. Con query solo devuelve las que contienen esas palabras en el título, artista o álbum (sin distinguir mayúsculas ni acentos): úsalo en playlists grandes. Acepta el nombre exacto de la playlist, su id o su enlace.",
+      description: "Devuelve las canciones de una playlist, en orden, con título, artistas, álbum, fecha de salida, duración, ISRC (identifica la grabación) y fecha en que se añadió. Con query solo devuelve las que contienen esas palabras en el título, artista o álbum (sin distinguir mayúsculas ni acentos): úsalo en playlists grandes. Con not_in / also_in la cruza con otra lista y matches da el tamaño del resultado (usa limit bajo si solo quieres contar). Acepta el nombre exacto de la playlist, su id o su enlace.",
       inputSchema: {
         playlist: z.string().describe('Nombre exacto (p. ej. "Bible"), id de 22 caracteres o enlace open.spotify.com/playlist/...'),
         query: z.string().optional().describe('Palabras a buscar, p. ej. "oceans hillsong". Opcional.'),
         ...PAGING,
+        ...SETS,
+        duplicates: DUPLICATES,
       },
       annotations: { readOnlyHint: true },
     },
-    async ({ playlist, query, limit, offset, brief }) => {
-      const data = await getPlaylistTracks(playlist, query, { limit, offset, brief });
+    async ({ playlist, query, ...opts }) => {
+      const data = await getPlaylistTracks(playlist, query, opts);
       return { content: [{ type: "text", text: JSON.stringify(data) }] };
     }
   );
@@ -710,10 +767,10 @@ function buildMcpServer() {
     {
       title: "Canciones de «Me gusta»",
       description: "Devuelve las canciones guardadas en «Me gusta» (de la más reciente a la más antigua), con título, artistas, álbum, fecha de salida, duración, ISRC y fecha en que se guardó. Con query filtra por título, artista o álbum (sin distinguir mayúsculas ni acentos). Suele tener miles de canciones: usa brief y limit/offset.",
-      inputSchema: { query: z.string().optional().describe("Palabras a buscar. Opcional."), ...PAGING },
+      inputSchema: { query: z.string().optional().describe("Palabras a buscar. Opcional."), ...PAGING, ...SETS, duplicates: DUPLICATES },
       annotations: { readOnlyHint: true },
     },
-    async ({ query, limit, offset, brief }) => json(await getSavedTracks(query, { limit, offset, brief }))
+    async ({ query, ...opts }) => json(await getSavedTracks(query, opts))
   );
 
   server.registerTool(
@@ -748,10 +805,11 @@ function buildMcpServer() {
         time_range: z.enum(["short_term", "medium_term", "long_term"]).optional().describe("Por defecto medium_term"),
         limit: z.number().int().min(1).max(500).optional().describe("Cuántos devolver (por defecto 50; Spotify suele cortar antes)"),
         brief: PAGING.brief,
+        ...SETS,
       },
       annotations: { readOnlyHint: true },
     },
-    async ({ type, time_range, limit, brief }) => json(await getTop(type, time_range, limit, brief))
+    async ({ type, time_range, limit, brief, not_in, also_in }) => json(await getTop(type, time_range, limit, brief, { not_in, also_in }))
   );
 
   server.registerTool(
