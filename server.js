@@ -58,20 +58,28 @@ const hasBlob = Boolean(rwTokenEnv || storeIdEnv);
 console.log(`Almacén Blob: ${hasBlob ? (rwTokenEnv?.[0] || storeIdEnv?.[0]) : "no configurado"}`);
 let stored; // { refresh_token, obtained_at } | null | undefined (sin leer)
 
+let tokenLoading; // lectura en curso: las llamadas simultáneas en un arranque en frío esperan a la misma
+
 async function loadToken() {
   if (stored !== undefined) return stored;
-  stored = null;
-  if (hasBlob) {
-    try {
-      const res = await getBlob(BLOB_PATH, { access: "private", ...blobAuth });
-      if (res?.statusCode === 200) stored = JSON.parse(await new Response(res.stream).text());
-    } catch (err) {
-      console.warn("No se pudo leer el token del almacén Blob:", err.message);
+  tokenLoading ||= (async () => {
+    let token = null;
+    if (hasBlob) {
+      try {
+        const res = await getBlob(BLOB_PATH, { access: "private", ...blobAuth });
+        if (res?.statusCode === 200) token = JSON.parse(await new Response(res.stream).text());
+      } catch (err) {
+        console.warn("No se pudo leer el token del almacén Blob:", err.message);
+      }
     }
-  }
-  if (!stored?.refresh_token && SPOTIFY_REFRESH_TOKEN) {
-    stored = { refresh_token: SPOTIFY_REFRESH_TOKEN, obtained_at: null };
-  }
+    if (!token?.refresh_token && SPOTIFY_REFRESH_TOKEN) {
+      token = { refresh_token: SPOTIFY_REFRESH_TOKEN, obtained_at: null };
+    }
+    if (stored === undefined) stored = token; // no pisar un token guardado mientras tanto
+  })().finally(() => {
+    tokenLoading = undefined;
+  });
+  await tokenLoading;
   return stored;
 }
 
@@ -962,6 +970,49 @@ app.get("/callback", async (req, res) => {
   res.type("html").send(page("Spotify conectado", `${why}<p>Mientras tanto, puedes copiar este valor en la variable <code>SPOTIFY_REFRESH_TOKEN</code> y volver a desplegar:</p>
 <textarea readonly style="width:100%;height:120px">${data.refresh_token}</textarea>
 <p>Spotify pedirá volver a iniciar sesión hacia el <b>${renewBy}</b>. No compartas este valor.</p>`));
+});
+
+// Copia de trabajo para análisis fuera del servidor: «Me gusta», los tres tops, el índice de playlists
+// propias y el registro de escuchas, en un solo JSON. ?playlists=A,B añade el detalle (con added_at) de esas playlists.
+async function buildSnapshot(detailed = []) {
+  const [saved, short_term, medium_term, long_term] = await Promise.all([
+    getSavedTracks(),
+    getTop("tracks", "short_term", 500),
+    getTop("tracks", "medium_term", 500),
+    getTop("tracks", "long_term", 500),
+  ]);
+  const slim = ({ url, ...t }) => t;
+  let index = { index: [], pending: [] };
+  let plays = [];
+  if (hasBlob) {
+    index = await loadIndex(40_000);
+    await logPlays({ force: true }).catch(() => {});
+    const now = new Date().toISOString();
+    plays = (await Promise.all(monthsBetween("2026-11", now).map((m) => readJson(playsPath(m))))).flat().filter(Boolean);
+  }
+  const detail = {};
+  for (const name of detailed) detail[name] = (await getPlaylistTracks(name)).tracks.map(slim);
+  return {
+    generated_at: new Date().toISOString(),
+    saved: saved.tracks.map(slim),
+    top: { short_term: short_term.items.map(slim), medium_term: medium_term.items.map(slim), long_term: long_term.items.map(slim) },
+    playlists: index.index, // [{ id, name, tracks: [[id, isrc, "Artistas — Título"], ...] }]
+    playlists_pending: index.pending,
+    detail,
+    plays,
+  };
+}
+
+app.get(`/export/${MCP_SECRET}`, async (req, res) => {
+  try {
+    const detailed = String(req.query.playlists || "").split(",").map((x) => x.trim()).filter(Boolean);
+    const snapshot = await buildSnapshot(detailed);
+    res.setHeader("Content-Disposition", `attachment; filename="spotify-snapshot-${snapshot.generated_at.slice(0, 10)}.json"`);
+    res.json(snapshot);
+  } catch (err) {
+    console.error("Exportación:", err);
+    res.status(500).type("text").send(`No se pudo exportar: ${err.message}`);
+  }
 });
 
 // Tarea programada: guarda las últimas escuchas. No devuelve datos, y logPlays se limita sola a una vez cada 10 minutos.
