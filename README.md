@@ -1,15 +1,8 @@
 # Spotify Playlists MCP
 
-Servidor MCP remoto **de solo lectura** para que Claude pueda leer tus playlists de Spotify: listar tus playlists y ver todas las canciones de una de ellas. No puede modificar nada.
+Servidor MCP remoto para que Claude gestione tus playlists de Spotify y tu lista «Me gusta», y consulte qué escuchas más.
 
-Herramientas que ofrece:
-
-| Herramienta | Qué hace |
-| --- | --- |
-| `list_playlists` | Lista tus playlists con id, nombre, propietario y número de canciones |
-| `get_playlist_tracks` | Devuelve todas las canciones de una playlist (por nombre, id o enlace) |
-
-| `auth_status` | Indica si hay sesión de Spotify y cuántos días quedan para renovarla |
+Herramientas: ver la sección [Herramientas](#herramientas) al final.
 
 > Spotify obliga a volver a iniciar sesión cada 6 meses. Cuando caduca, las herramientas devuelven un mensaje con el enlace de `/login`. Con Vercel Blob el token nuevo se guarda solo: basta con abrir el enlace y pulsar «Aceptar».
 
@@ -33,7 +26,7 @@ En claude.ai: **Configuración → Conectores → Añadir conector personalizado
 - **URL**: `https://TU-PROYECTO.vercel.app/mcp/TU_MCP_SECRET`
 - **Autenticación**: *Sin inicio de sesión* (la protección es la ruta secreta)
 
-Trata esa URL como una contraseña: quien la tenga puede leer tus playlists.
+Trata esa URL como una contraseña: quien la tenga puede leer y modificar tus playlists y «Me gusta».
 
 ## Otras opciones
 
@@ -42,16 +35,22 @@ Trata esa URL como una contraseña: quien la tenga puede leer tus playlists.
 
 ## Seguridad
 
-- Solo pide los permisos `playlist-read-private` y `playlist-read-collaborative`.
+- Pide los permisos de playlists (`playlist-read-private`, `playlist-read-collaborative`, `playlist-modify-public`, `playlist-modify-private`), de «Me gusta» (`user-library-read`, `user-library-modify`) y de actividad (`user-top-read`, `user-read-recently-played`). Al añadir permisos nuevos hay que volver a abrir `/login/TU_MCP_SECRET`.
 - Nunca subas `.env` ni pegues el Client Secret o el refresh token en chats.
 - Si se filtra algo: regenera el Client Secret en Spotify y cambia `MCP_SECRET`.
 
 
 ## Herramientas
 
-- `list_playlists`: lista tus playlists.
-- `get_playlist_tracks`: canciones de una playlist, con ISRC y duración. El parámetro opcional `query` filtra por título, artista o álbum (útil en playlists grandes).
-- `search_tracks`: busca canciones en el catálogo de Spotify.
-- `add_tracks`: añade canciones a una playlist propia. Requiere haber iniciado sesión después de añadir los permisos `playlist-modify-public` y `playlist-modify-private`.
-- `remove_tracks`: quita canciones de una playlist propia (mismo permiso que `add_tracks`).
-- `auth_status`: estado de la sesión y enlace para volver a iniciarla.
+| Herramienta | Qué hace |
+| --- | --- |
+| `list_playlists` | Lista tus playlists. |
+| `get_playlist_tracks` | Canciones de una playlist, con ISRC, duración y fecha en que se añadieron. `query` opcional para filtrar. |
+| `search_tracks` | Busca canciones en el catálogo de Spotify. |
+| `add_tracks` | Añade canciones a una playlist propia, al final o en la posición `position`. |
+| `remove_tracks` | Quita canciones de una playlist propia (todas las apariciones). |
+| `get_saved_tracks` | Canciones de «Me gusta». `query` opcional para filtrar. |
+| `save_tracks` / `unsave_tracks` | Añade o quita canciones de «Me gusta» (usa `/me/library`, la API de febrero de 2026). |
+| `get_top_items` | Ranking de canciones o artistas más escuchados en ~4 semanas, ~6 meses o ~1 año. |
+| `get_recently_played` | Tus últimas 50 reproducciones. |
+| `auth_status` | Estado de la sesión y enlace para volver a iniciarla. |
