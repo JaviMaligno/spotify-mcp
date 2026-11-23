@@ -1,0 +1,18 @@
+# Guarda cada hora las últimas escuchas (Spotify solo conserva 50).
+# Opcional: solo actúa si existe el secreto LOG_PLAYS_URL, p. ej. https://TU-PROYECTO.vercel.app
+name: Registrar escuchas
+on:
+  schedule:
+    - cron: "17 * * * *"
+  workflow_dispatch:
+jobs:
+  log:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Llamar a /cron/log-plays
+        env:
+          LOG_PLAYS_URL: ${{ secrets.LOG_PLAYS_URL }}
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+        run: |
+          if [ -z "$LOG_PLAYS_URL" ]; then echo "Sin LOG_PLAYS_URL: nada que hacer."; exit 0; fi
+          curl -fsS --max-time 60 -H "Authorization: Bearer $CRON_SECRET" "${LOG_PLAYS_URL%/}/cron/log-plays"

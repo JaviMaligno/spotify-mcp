@@ -1,7 +1,7 @@
 {
   "name": "spotify-playlists-mcp",
-  "version": "1.0.0",
-  "description": "Servidor MCP remoto de solo lectura para tus playlists de Spotify",
+  "version": "1.2.0",
+  "description": "Servidor MCP remoto para tus playlists de Spotify, «Me gusta» y tu actividad de escucha",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
