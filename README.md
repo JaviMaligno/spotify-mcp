@@ -28,6 +28,16 @@ En claude.ai: **Configuración → Conectores → Añadir conector personalizado
 
 Trata esa URL como una contraseña: quien la tenga puede leer y modificar tus playlists y «Me gusta».
 
+## Registro de escuchas
+
+Spotify solo devuelve las últimas 50 reproducciones, así que el servidor las va acumulando en el almacén Blob (`spotify/plays/AAAA-MM.json`), con la playlist o el contexto desde el que sonó cada una. Se guardan:
+
+- cada vez que Claude usa el conector (como mucho una vez cada 10 minutos);
+- una vez al día con Vercel Cron (`vercel.json`; el plan Hobby no permite más frecuencia);
+- cada hora con GitHub Actions (`.github/workflows/log-plays.yml`), si añades en el repositorio el secreto `LOG_PLAYS_URL` con la URL pública (p. ej. `https://TU-PROYECTO.vercel.app`). Recomendado si escuchas más de 50 canciones al día.
+
+`/cron/log-plays` no devuelve datos. Si defines `CRON_SECRET` en Vercel, exige `Authorization: Bearer <valor>` (Vercel Cron lo envía solo; añade el mismo secreto en GitHub).
+
 ## Otras opciones
 
 - **En local:** `npm install`, rellena `.env` y ejecuta `node --env-file=.env server.js`.
@@ -45,12 +55,14 @@ Trata esa URL como una contraseña: quien la tenga puede leer y modificar tus pl
 | Herramienta | Qué hace |
 | --- | --- |
 | `list_playlists` | Lista tus playlists. |
-| `get_playlist_tracks` | Canciones de una playlist, con ISRC, duración y fecha en que se añadieron. `query` opcional para filtrar. |
+| `get_playlist_tracks` | Canciones de una playlist, con ISRC, duración y fecha en que se añadieron. `query` opcional para filtrar; `limit`/`offset` para paginar y `brief` para una línea por canción. |
 | `search_tracks` | Busca canciones en el catálogo de Spotify. |
 | `add_tracks` | Añade canciones a una playlist propia, al final o en la posición `position`. |
 | `remove_tracks` | Quita canciones de una playlist propia (todas las apariciones). |
-| `get_saved_tracks` | Canciones de «Me gusta». `query` opcional para filtrar. |
+| `get_saved_tracks` | Canciones de «Me gusta». `query` opcional para filtrar; `limit`/`offset` y `brief` como arriba. |
 | `save_tracks` / `unsave_tracks` | Añade o quita canciones de «Me gusta» (usa `/me/library`, la API de febrero de 2026). |
 | `get_top_items` | Ranking de canciones o artistas más escuchados en ~4 semanas, ~6 meses o ~1 año. |
 | `get_recently_played` | Tus últimas 50 reproducciones. |
+| `get_play_log` | Registro acumulado de escuchas: resumen por canción (veces, días, última vez, desde qué playlist) o lista cronológica con `detail`. Necesita Blob. |
+| `find_in_playlists` | En qué playlists propias está cada canción, comparando por ISRC. Indexa las playlists en Blob y solo vuelve a descargar las que cambian. |
 | `auth_status` | Estado de la sesión y enlace para volver a iniciarla. |

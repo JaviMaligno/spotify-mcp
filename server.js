@@ -1,4 +1,4 @@
-// Servidor MCP remoto de solo lectura para tus playlists de Spotify.
+// Servidor MCP remoto para tus playlists de Spotify, «Me gusta» y tu actividad de escucha.
 // Pensado para un único usuario: tú. Se protege con una ruta secreta.
 // Funciona en Vercel (exporta la app) y en cualquier servidor Node (app.listen).
 
@@ -17,6 +17,7 @@ const {
   PUBLIC_URL, // URL pública sin barra final; en Vercel se deduce sola
   BLOB_READ_WRITE_TOKEN, // almacenes Blob antiguos o fuera de Vercel
   BLOB_STORE_ID, // almacenes Blob nuevos conectados al proyecto (autenticación OIDC)
+  CRON_SECRET, // opcional: si existe, /cron/log-plays exige «Authorization: Bearer <valor>» (Vercel Cron lo envía solo)
   PORT = 3000,
 } = process.env;
 
@@ -92,6 +93,28 @@ async function clearToken() {
   stored = null;
   if (hasBlob) await saveToken({ refresh_token: null, obtained_at: null, expired_at: new Date().toISOString() });
 }
+
+// ---------- Almacén de datos (registro de escuchas e índice de playlists) ----------
+async function readJson(path) {
+  if (!hasBlob) return null;
+  const res = await getBlob(path, { access: "private", useCache: false, ...blobAuth });
+  return res?.statusCode === 200 ? JSON.parse(await new Response(res.stream).text()) : null;
+}
+
+async function writeJson(path, data) {
+  await put(path, JSON.stringify(data), {
+    access: "private",
+    ...blobAuth,
+    contentType: "application/json",
+    allowOverwrite: true,
+    addRandomSuffix: false,
+    cacheControlMaxAge: 60,
+  });
+}
+
+const needBlob = (what) => {
+  if (!hasBlob) throw new Error(`${what} necesita el almacén Blob de Vercel (BLOB_STORE_ID o BLOB_READ_WRITE_TOKEN).`);
+};
 
 function daysLeft(token) {
   if (!token?.obtained_at) return null;
@@ -190,8 +213,29 @@ function formatTrack(t) {
     duration: fmtDuration(t.duration_ms),
     isrc: t.external_ids?.isrc,
     id: t.id,
-    uri: t.uri,
     url: t.external_urls?.spotify,
+  };
+}
+
+// Una línea por canción: «[#rank|posición.] id isrc [fecha] Artistas — Título». Ahorra ~75 % de texto.
+const briefTrack = (t) =>
+  [
+    t.rank && `#${t.rank}`,
+    t.position && `${t.position}.`,
+    t.id,
+    t.isrc || "-",
+    t.added_at?.slice(0, 10),
+    `${(t.artists || []).join(", ")} — ${t.name}`,
+  ]
+    .filter(Boolean)
+    .join(" ");
+
+// Aplica offset/limit y, si se pide, el formato breve
+function shape(tracks, { limit, offset = 0, brief } = {}) {
+  const slice = tracks.slice(offset, limit ? offset + limit : undefined);
+  return {
+    ...(limit || offset ? { offset, returned: slice.length } : {}),
+    tracks: brief ? slice.map(briefTrack) : slice,
   };
 }
 
@@ -239,6 +283,8 @@ async function listPlaylists() {
         id: p.id,
         name: p.name,
         owner: p.owner?.display_name || p.owner?.id,
+        owner_id: p.owner?.id,
+        snapshot_id: p.snapshot_id,
         tracks: p.tracks?.total ?? p.items?.total ?? null,
         url: p.external_urls?.spotify,
       });
@@ -268,7 +314,7 @@ async function resolvePlaylist(value) {
   throw new Error(`No encuentro ninguna playlist llamada "${value}".`);
 }
 
-async function getPlaylistTracks(value, query) {
+async function getPlaylistTracks(value, query, opts) {
   const { id } = await resolvePlaylist(value);
   const meta = await spotify(`/playlists/${id}?fields=id,name,owner(display_name),external_urls`);
   const F = "total,next,items(added_at,item(id,name,uri,type,duration_ms,external_ids(isrc),artists(name),album(name,release_date),external_urls),track(id,name,uri,type,duration_ms,external_ids(isrc),artists(name),album(name,release_date),external_urls))";
@@ -281,13 +327,13 @@ async function getPlaylistTracks(value, query) {
       const t = item.item || item.track; // la API de 2026 usa "item"
       if (!t) continue; // canciones eliminadas o no disponibles
       if (t.type && t.type !== "track") continue; // ignora episodios de podcast
-      const { id: tid, uri, url, ...rest } = formatTrack(t);
-      tracks.push({ position: index, ...rest, added_at: item.added_at, id: tid, uri, url });
+      const { id: tid, url, ...rest } = formatTrack(t);
+      tracks.push({ position: index, ...rest, added_at: item.added_at, id: tid, url });
     }
   }
   const total = tracks.length;
   const out = filterTracks(tracks, query);
-  return { id: meta.id, name: meta.name, owner: meta.owner?.display_name, url: meta.external_urls?.spotify, total, ...(query ? { query, matches: out.length } : {}), tracks: out };
+  return { id: meta.id, name: meta.name, owner: meta.owner?.display_name, url: meta.external_urls?.spotify, total, ...(query ? { query, matches: out.length } : {}), ...shape(out, opts) };
 }
 
 async function addTracks(value, tracks, position) {
@@ -317,19 +363,33 @@ async function removeTracks(value, tracks) {
 }
 
 // ---------- «Me gusta» (canciones guardadas) ----------
-async function getSavedTracks(query) {
-  const pages = await fetchAllPages((offset) => `/me/tracks?limit=50&offset=${offset}`, 50);
+async function getSavedTracks(query, { limit, offset = 0, brief } = {}) {
+  const pageUrl = (o) => `/me/tracks?limit=50&offset=${o}`;
+  // Sin query y con limit basta con descargar las páginas pedidas
+  const partial = !query && limit;
+  let pages;
+  let first = 0;
+  if (partial) {
+    first = Math.floor(offset / 50) * 50;
+    const offsets = [];
+    for (let o = first; o < offset + limit; o += 50) offsets.push(o);
+    pages = await Promise.all(offsets.map((o) => spotify(pageUrl(o))));
+  } else {
+    pages = await fetchAllPages(pageUrl, 50);
+  }
   const tracks = [];
   for (const page of pages) {
     for (const item of page.items || []) {
       const t = item.item || item.track;
       if (!t || (t.type && t.type !== "track")) continue;
-      const { id, uri, url, ...rest } = formatTrack(t);
-      tracks.push({ ...rest, added_at: item.added_at, id, uri, url });
+      const { id, url, ...rest } = formatTrack(t);
+      tracks.push({ ...rest, added_at: item.added_at, id, url });
     }
   }
   const out = filterTracks(tracks, query);
-  return { total: tracks.length, ...(query ? { query, matches: out.length } : {}), tracks: out };
+  const total = partial ? pages[0]?.total ?? tracks.length : tracks.length;
+  const shaped = shape(out, { limit, offset: partial ? offset - first : offset, brief });
+  return { total, ...(query ? { query, matches: out.length } : {}), ...shaped, ...(limit || offset ? { offset } : {}) };
 }
 
 // Desde febrero de 2026 guardar y quitar usan /me/library con uris (máx. 40 por petición)
@@ -344,7 +404,7 @@ async function changeLibrary(tracks, method) {
 // ---------- Actividad de escucha ----------
 const TIME_RANGES = { short_term: "~4 semanas", medium_term: "~6 meses", long_term: "~1 año" };
 
-async function getTop(type, timeRange = "medium_term", limit = 50) {
+async function getTop(type, timeRange = "medium_term", limit = 50, brief = false) {
   const items = [];
   let next = `/me/top/${type}?time_range=${timeRange}&limit=50`;
   while (next && items.length < limit) {
@@ -357,7 +417,7 @@ async function getTop(type, timeRange = "medium_term", limit = 50) {
       ? { rank: i + 1, ...formatTrack(x) }
       : { rank: i + 1, name: x.name, genres: x.genres, id: x.id, url: x.external_urls?.spotify }
   );
-  return { type, time_range: timeRange, period: TIME_RANGES[timeRange], total: list.length, items: list };
+  return { type, time_range: timeRange, period: TIME_RANGES[timeRange], total: list.length, items: brief && type === "tracks" ? list.map(briefTrack) : list };
 }
 
 async function getRecentlyPlayed() {
@@ -369,9 +429,195 @@ async function getRecentlyPlayed() {
   }));
 }
 
+// ---------- Registro de escuchas ----------
+// Spotify solo devuelve las últimas 50 reproducciones. Aquí se acumulan en Blob, un archivo por mes,
+// con el contexto (playlist, álbum…) desde el que sonó cada una, que el historial extendido no trae.
+const playsPath = (month) => `spotify/plays/${month}.json`;
+const LOG_EVERY = 10 * 60_000;
+let lastLogAt = 0;
+
+async function logPlays({ force = false } = {}) {
+  if (!hasBlob) return { logged: 0 };
+  if (!force && Date.now() - lastLogAt < LOG_EVERY) return { logged: 0, skipped: true };
+  const previous = lastLogAt;
+  lastLogAt = Date.now();
+  try {
+    const data = await spotify("/me/player/recently-played?limit=50");
+    const byMonth = new Map();
+    for (const x of data.items || []) {
+      const t = x.track || x.item;
+      if (!t || !x.played_at) continue;
+      const month = x.played_at.slice(0, 7);
+      if (!byMonth.has(month)) byMonth.set(month, []);
+      byMonth.get(month).push({
+        played_at: x.played_at,
+        id: t.id,
+        isrc: t.external_ids?.isrc ?? null,
+        name: t.name,
+        artists: (t.artists || []).map((a) => a.name),
+        duration_ms: t.duration_ms,
+        context: x.context?.uri ?? null,
+      });
+    }
+    let logged = 0;
+    for (const [month, plays] of byMonth) {
+      const existing = (await readJson(playsPath(month))) || [];
+      const seen = new Set(existing.map((p) => p.played_at));
+      const fresh = plays.filter((p) => !seen.has(p.played_at));
+      if (!fresh.length) continue;
+      const merged = [...existing, ...fresh].sort((a, b) => (a.played_at < b.played_at ? -1 : 1));
+      await writeJson(playsPath(month), merged);
+      logged += fresh.length;
+    }
+    return { logged };
+  } catch (err) {
+    lastLogAt = previous; // que el siguiente intento no espere
+    throw err;
+  }
+}
+
+function monthsBetween(from, to) {
+  const out = [];
+  let [y, m] = from.slice(0, 7).split("-").map(Number);
+  const end = to.slice(0, 7);
+  for (let i = 0; i < 240; i++) {
+    const key = `${y}-${String(m).padStart(2, "0")}`;
+    if (key > end) break;
+    out.push(key);
+    if (++m > 12) (m = 1), y++;
+  }
+  return out;
+}
+
+async function getPlayLog({ since, until, detail = false, limit = 200 } = {}) {
+  needBlob("El registro de escuchas");
+  await logPlays({ force: true }).catch((err) => console.warn("No se pudo actualizar el registro:", err.message));
+  const now = new Date().toISOString();
+  const from = since || new Date(Date.now() - 30 * DAY).toISOString().slice(0, 10);
+  const to = until || now.slice(0, 10);
+  const files = await Promise.all(monthsBetween(from, to).map((m) => readJson(playsPath(m))));
+  const plays = files.flat().filter((p) => p && p.played_at >= from && p.played_at.slice(0, to.length) <= to);
+
+  const names = new Map((await listPlaylists()).map((p) => [`spotify:playlist:${p.id}`, p.name]));
+  const where = (uri) => {
+    if (!uri) return "sin contexto";
+    if (names.has(uri)) return names.get(uri);
+    if (uri.endsWith(":collection")) return "Me gusta";
+    return uri.split(":").slice(1, 3).join(":"); // album:<id>, artist:<id>, playlist:<id ajena>
+  };
+  const range = { since: from, until: to, plays: plays.length, oldest: plays[0]?.played_at ?? null };
+
+  if (detail) {
+    const rows = plays.slice(-limit).map((p) => `${p.played_at.slice(0, 16)} ${p.id} ${p.isrc || "-"} ${p.artists.join(", ")} — ${p.name} [${where(p.context)}]`);
+    return { ...range, returned: rows.length, rows };
+  }
+  const byTrack = new Map();
+  for (const p of plays) {
+    const key = p.isrc || p.id;
+    if (!byTrack.has(key)) byTrack.set(key, { plays: 0, id: p.id, isrc: p.isrc, track: `${p.artists.join(", ")} — ${p.name}`, days: new Set(), last: p.played_at, from: {} });
+    const s = byTrack.get(key);
+    s.plays++;
+    s.days.add(p.played_at.slice(0, 10));
+    if (p.played_at > s.last) s.last = p.played_at;
+    const w = where(p.context);
+    s.from[w] = (s.from[w] || 0) + 1;
+  }
+  const tracks = [...byTrack.values()]
+    .sort((a, b) => b.plays - a.plays || (a.last < b.last ? 1 : -1))
+    .slice(0, limit)
+    .map((s) => ({ ...s, days: s.days.size, last: s.last.slice(0, 10) }));
+  return { ...range, distinct_tracks: byTrack.size, returned: tracks.length, tracks };
+}
+
+// ---------- Índice de playlists propias ----------
+// Para saber en qué playlists está una canción (comparando por ISRC, que sobrevive a los cambios de id).
+// Cada playlist se guarda en Blob con su snapshot_id y solo se vuelve a descargar cuando cambia.
+const indexPath = (id) => `spotify/index/${id}.json`;
+const indexMem = new Map(); // id -> { snapshot_id, tracks: [[id, isrc, "Artistas — Título"], ...] }
+
+async function loadIndex(budgetMs = 20_000) {
+  needBlob("El índice de playlists");
+  const start = Date.now();
+  const me = await spotify("/me");
+  const own = (await listPlaylists()).filter((p) => p.owner_id === me.id).sort((a, b) => (a.tracks || 0) - (b.tracks || 0));
+  const cached = await Promise.all(
+    own.map((p) => (indexMem.get(p.id)?.snapshot_id === p.snapshot_id ? indexMem.get(p.id) : readJson(indexPath(p.id)).catch(() => null)))
+  );
+  const index = [];
+  const pending = [];
+  for (let i = 0; i < own.length; i++) {
+    const p = own[i];
+    let entry = cached[i];
+    if (!entry || entry.snapshot_id !== p.snapshot_id) {
+      if (Date.now() - start > budgetMs) {
+        pending.push(p.name); // se indexará en la siguiente llamada; mientras, vale la copia anterior si existe
+        if (!entry) continue;
+      } else {
+        const data = await getPlaylistTracks(p.id);
+        entry = { snapshot_id: p.snapshot_id, tracks: data.tracks.map((t) => [t.id, t.isrc || null, `${t.artists.join(", ")} — ${t.name}`]) };
+        await writeJson(indexPath(p.id), entry);
+      }
+    }
+    indexMem.set(p.id, entry);
+    index.push({ id: p.id, name: p.name, tracks: entry.tracks });
+  }
+  return { index, pending };
+}
+
+const ISRC_RE = /^[A-Za-z]{2}[A-Za-z0-9]{3}\d{7}$/;
+
+async function findInPlaylists({ tracks = [], playlist } = {}) {
+  if (!tracks.length && !playlist) throw new Error("Indica tracks, playlist o ambos.");
+  const { index, pending } = await loadIndex();
+  const byId = new Map(); // id -> { isrc, label }
+  const idIn = new Map(); // id -> Set(nombres)
+  const isrcIn = new Map(); // isrc -> Set(nombres)
+  const add = (map, key, name) => key && (map.get(key) || map.set(key, new Set()).get(key)).add(name);
+  for (const p of index) {
+    for (const [id, isrc, label] of p.tracks) {
+      if (!byId.has(id)) byId.set(id, { isrc, label });
+      add(idIn, id, p.name);
+      add(isrcIn, isrc?.toUpperCase(), p.name);
+    }
+  }
+  const wanted = [];
+  let skip = null;
+  if (playlist) {
+    const data = await getPlaylistTracks(playlist);
+    skip = data.name;
+    for (const t of data.tracks) wanted.push({ id: t.id, isrc: t.isrc, label: `${t.artists.join(", ")} — ${t.name}` });
+  }
+  for (const raw of tracks) {
+    if (ISRC_RE.test(raw)) {
+      wanted.push({ isrc: raw });
+      continue;
+    }
+    const id = toTrackUris([raw])[0].split(":")[2];
+    wanted.push({ id, ...byId.get(id) });
+  }
+  const results = wanted.map((w) => {
+    const isrc = w.isrc?.toUpperCase();
+    const found = new Set([...(idIn.get(w.id) || []), ...(isrcIn.get(isrc) || [])]);
+    if (skip) found.delete(skip);
+    return { track: w.label ?? null, id: w.id ?? null, isrc: isrc ?? null, playlists: [...found].sort() };
+  });
+  return {
+    indexed_playlists: index.length,
+    ...(pending.length ? { pending, note: "Faltan playlists por indexar: repite la llamada para completarlas." } : {}),
+    ...(skip ? { excluding: skip } : {}),
+    results,
+  };
+}
+
 // ---------- Servidor MCP ----------
+const PAGING = {
+  limit: z.number().int().min(1).optional().describe("Máximo de canciones a devolver. Por defecto, todas."),
+  offset: z.number().int().min(0).optional().describe("Cuántas saltar desde el principio (para paginar). Por defecto 0."),
+  brief: z.boolean().optional().describe("true = una línea por canción («id isrc fecha Artistas — Título»). Recomendado en listas grandes."),
+};
+
 function buildMcpServer() {
-  const server = new McpServer({ name: "spotify-playlists", version: "1.1.0" });
+  const server = new McpServer({ name: "spotify-playlists", version: "1.2.0" });
 
   server.registerTool(
     "list_playlists",
@@ -383,7 +629,7 @@ function buildMcpServer() {
     },
     async () => {
       const playlists = await listPlaylists();
-      return { content: [{ type: "text", text: JSON.stringify({ total: playlists.length, playlists }, null, 2) }] };
+      return { content: [{ type: "text", text: JSON.stringify({ total: playlists.length, playlists }) }] };
     }
   );
 
@@ -395,12 +641,13 @@ function buildMcpServer() {
       inputSchema: {
         playlist: z.string().describe('Nombre exacto (p. ej. "Bible"), id de 22 caracteres o enlace open.spotify.com/playlist/...'),
         query: z.string().optional().describe('Palabras a buscar, p. ej. "oceans hillsong". Opcional.'),
+        ...PAGING,
       },
       annotations: { readOnlyHint: true },
     },
-    async ({ playlist, query }) => {
-      const data = await getPlaylistTracks(playlist, query);
-      return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+    async ({ playlist, query, limit, offset, brief }) => {
+      const data = await getPlaylistTracks(playlist, query, { limit, offset, brief });
+      return { content: [{ type: "text", text: JSON.stringify(data) }] };
     }
   );
 
@@ -418,7 +665,7 @@ function buildMcpServer() {
     },
     async ({ playlist, tracks, position }) => {
       const data = await addTracks(playlist, tracks, position);
-      return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+      return { content: [{ type: "text", text: JSON.stringify(data) }] };
     }
   );
 
@@ -435,7 +682,7 @@ function buildMcpServer() {
     },
     async ({ query, limit }) => {
       const data = await searchTracks(query, limit);
-      return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+      return { content: [{ type: "text", text: JSON.stringify(data) }] };
     }
   );
 
@@ -452,21 +699,21 @@ function buildMcpServer() {
     },
     async ({ playlist, tracks }) => {
       const data = await removeTracks(playlist, tracks);
-      return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+      return { content: [{ type: "text", text: JSON.stringify(data) }] };
     }
   );
 
-  const json = (data) => ({ content: [{ type: "text", text: JSON.stringify(data, null, 2) }] });
+  const json = (data) => ({ content: [{ type: "text", text: JSON.stringify(data) }] });
 
   server.registerTool(
     "get_saved_tracks",
     {
       title: "Canciones de «Me gusta»",
-      description: "Devuelve las canciones guardadas en «Me gusta» (de la más reciente a la más antigua), con título, artistas, álbum, fecha de salida, duración, ISRC y fecha en que se guardó. Con query filtra por título, artista o álbum (sin distinguir mayúsculas ni acentos).",
-      inputSchema: { query: z.string().optional().describe("Palabras a buscar. Opcional.") },
+      description: "Devuelve las canciones guardadas en «Me gusta» (de la más reciente a la más antigua), con título, artistas, álbum, fecha de salida, duración, ISRC y fecha en que se guardó. Con query filtra por título, artista o álbum (sin distinguir mayúsculas ni acentos). Suele tener miles de canciones: usa brief y limit/offset.",
+      inputSchema: { query: z.string().optional().describe("Palabras a buscar. Opcional."), ...PAGING },
       annotations: { readOnlyHint: true },
     },
-    async ({ query }) => json(await getSavedTracks(query))
+    async ({ query, limit, offset, brief }) => json(await getSavedTracks(query, { limit, offset, brief }))
   );
 
   server.registerTool(
@@ -500,10 +747,11 @@ function buildMcpServer() {
         type: z.enum(["tracks", "artists"]).describe("tracks o artists"),
         time_range: z.enum(["short_term", "medium_term", "long_term"]).optional().describe("Por defecto medium_term"),
         limit: z.number().int().min(1).max(500).optional().describe("Cuántos devolver (por defecto 50; Spotify suele cortar antes)"),
+        brief: PAGING.brief,
       },
       annotations: { readOnlyHint: true },
     },
-    async ({ type, time_range, limit }) => json(await getTop(type, time_range, limit))
+    async ({ type, time_range, limit, brief }) => json(await getTop(type, time_range, limit, brief))
   );
 
   server.registerTool(
@@ -515,6 +763,36 @@ function buildMcpServer() {
       annotations: { readOnlyHint: true },
     },
     async () => json(await getRecentlyPlayed())
+  );
+
+  server.registerTool(
+    "get_play_log",
+    {
+      title: "Registro acumulado de escuchas",
+      description: "Historial de reproducciones que este servidor va guardando (Spotify solo da las últimas 50). Por defecto resume por canción: número de escuchas, días distintos, última vez y desde qué playlist o contexto sonó. Con detail devuelve las reproducciones una a una. El registro empieza el día en que se desplegó esta función.",
+      inputSchema: {
+        since: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().describe("Fecha inicial AAAA-MM-DD (UTC). Por defecto, hace 30 días."),
+        until: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().describe("Fecha final AAAA-MM-DD (UTC), incluida. Por defecto, hoy."),
+        detail: z.boolean().optional().describe("true = lista cronológica de reproducciones en vez del resumen por canción."),
+        limit: z.number().int().min(1).max(2000).optional().describe("Máximo de filas (por defecto 200: las más escuchadas, o las más recientes con detail)."),
+      },
+      annotations: { readOnlyHint: true },
+    },
+    async (args) => json(await getPlayLog(args))
+  );
+
+  server.registerTool(
+    "find_in_playlists",
+    {
+      title: "En qué playlists está una canción",
+      description: "Para cada canción indica en cuáles de tus playlists propias está, comparando por ISRC (misma grabación aunque cambie el id). Pasa tracks (ids, uris, enlaces o ISRC) y/o playlist para cruzar todas las canciones de una playlist con las demás. Sirve para usar tus playlists como etiquetas de género (p. ej. saber qué es bachata). La primera llamada indexa todas tus playlists y puede tardar; si devuelve pending, repítela.",
+      inputSchema: {
+        tracks: z.array(z.string()).optional().describe("Ids, uris, enlaces o ISRC de canciones"),
+        playlist: z.string().optional().describe("Nombre exacto, id o enlace de una playlist cuyas canciones se quieren cruzar"),
+      },
+      annotations: { readOnlyHint: true },
+    },
+    async (args) => json(await findInPlaylists(args))
   );
 
   server.registerTool(
@@ -534,7 +812,7 @@ function buildMcpServer() {
         auto_save: hasBlob,
         login_url: LOGIN_URL,
       };
-      return { content: [{ type: "text", text: JSON.stringify(info, null, 2) }] };
+      return { content: [{ type: "text", text: JSON.stringify(info) }] };
     }
   );
 
@@ -548,6 +826,8 @@ app.use(express.json({ limit: "1mb" }));
 const MCP_PATH = `/mcp/${MCP_SECRET}`;
 
 app.post(MCP_PATH, async (req, res) => {
+  // Cada uso del conector aprovecha para guardar las últimas escuchas (como mucho cada 10 minutos)
+  if (req.body?.method === "tools/call") await logPlays().catch((err) => console.warn("Registro de escuchas:", err.message));
   const server = buildMcpServer();
   const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined }); // sin estado
   res.on("close", () => {
@@ -620,6 +900,18 @@ app.get("/callback", async (req, res) => {
   res.type("html").send(page("Spotify conectado", `${why}<p>Mientras tanto, puedes copiar este valor en la variable <code>SPOTIFY_REFRESH_TOKEN</code> y volver a desplegar:</p>
 <textarea readonly style="width:100%;height:120px">${data.refresh_token}</textarea>
 <p>Spotify pedirá volver a iniciar sesión hacia el <b>${renewBy}</b>. No compartas este valor.</p>`));
+});
+
+// Tarea programada: guarda las últimas escuchas. No devuelve datos, y logPlays se limita sola a una vez cada 10 minutos.
+app.get("/cron/log-plays", async (req, res) => {
+  if (CRON_SECRET && req.headers.authorization !== `Bearer ${CRON_SECRET}`) return res.status(401).json({ ok: false });
+  try {
+    await logPlays();
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("Registro de escuchas:", err);
+    res.status(500).json({ ok: false });
+  }
 });
 
 app.get("/", (_req, res) => res.type("text").send("OK"));
