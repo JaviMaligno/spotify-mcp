@@ -70,5 +70,5 @@ Spotify solo devuelve las últimas 50 reproducciones, así que el servidor las v
 | *(filtros)* | En `get_playlist_tracks`, `get_saved_tracks` y `get_top_items`: `not_in` / `also_in` cruzan con otra playlist o con `me_gusta` por ISRC (`matches` da el tamaño); `duplicates` deja solo las grabaciones repetidas. |
 | `get_play_log` | Registro acumulado de escuchas: resumen por canción (veces, días, última vez, desde qué playlist) o lista cronológica con `detail`. Necesita Blob. |
 | `find_in_playlists` | En qué playlists propias está cada canción, comparando por ISRC. Indexa las playlists en Blob y solo vuelve a descargar las que cambian. |
-| `recommend` | Motor de recomendación para «Me gusta» o una playlist: aprende de lo que ya está en la lista, se valida escondiendo parte de ella y propone candidatas (y canciones a revisar) con el motivo. Solo lee. |
+| `recommend` | Motor de recomendación guiado por decisiones recientes: aprende de los veredictos sí/no que guarda (`yes`, `no`) y de lo añadido a la lista desde `since`, no de lo que ya estaba. Devuelve candidatas, dudosas para preguntar y lo de la lista que menos encaja hoy. No cambia nada en Spotify. |
 | `auth_status` | Estado de la sesión y enlace para volver a iniciarla. |
