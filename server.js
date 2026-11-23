@@ -191,6 +191,12 @@ async function spotify(pathOrUrl, { method = "GET", body } = {}) {
     const res = await fetch(url, { method, headers, body: body ? JSON.stringify(body) : undefined });
     if (res.status === 429) {
       const wait = Number(res.headers.get("retry-after") || 1);
+      if (wait > 15) {
+        // Esperas largas (pueden ser horas): mejor avisar que dejar la llamada colgada
+        const until = new Date(Date.now() + wait * 1000).toISOString().slice(0, 16).replace("T", " ");
+        const pretty = wait >= 3600 ? `${(wait / 3600).toFixed(1)} h` : `${Math.ceil(wait / 60)} min`;
+        throw new Error(`Spotify ha limitado las peticiones a ${new URL(url).pathname}: hay que esperar ${pretty} (hasta las ${until} UTC). No se ha hecho el cambio; repítelo después.`);
+      }
       await new Promise((r) => setTimeout(r, wait * 1000));
       continue;
     }
