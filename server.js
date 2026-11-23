@@ -732,7 +732,12 @@ function seededShuffle(arr, seed = 7) {
 
 const round = (x, n = 2) => (x == null ? null : Number(x.toFixed(n)));
 
-async function recommend({ target, within, exclude = [], cutoff, top = 30 } = {}) {
+// Lo que se aprende son las decisiones RECIENTES y fechadas: veredictos guardados (sí/no) y lo añadido
+// a la lista desde `since`. Lo que ya estaba en la lista de antes no se da por bueno: las listas pueden
+// estar anticuadas, así que el modelo las puntúa igual que al resto y señala las que menos encajan hoy.
+const FEEDBACK_PATH = "spotify/feedback.json";
+
+async function recommend({ target, within, exclude = [], since, yes = [], no = [], top = 30, ask = 20 } = {}) {
   needBlob("El motor de recomendación");
   const targetIsLiked = LIKED_RE.test(target.trim());
   const [{ index, pending }, saved, ...tops] = await Promise.all([
@@ -744,39 +749,46 @@ async function recommend({ target, within, exclude = [], cutoff, top = 30 } = {}
   ]);
   const targetData = targetIsLiked ? saved : await getPlaylistTracks(target);
   const targetName = targetIsLiked ? "Me gusta" : targetData.name;
+  const now = new Date().toISOString();
+  const sinceDate = since || new Date(Date.now() - 365 * DAY).toISOString().slice(0, 10);
 
   // Canciones conocidas, por ISRC (o id si no tiene)
   const tracks = new Map(); // clave -> { id, label, artists }
+  const keyOfId = new Map();
   const see = (isrc, id, label, artists) => {
     const k = isrc?.toUpperCase() || id;
     if (!tracks.has(k)) tracks.set(k, { id, label, artists: artists || label.split(" — ")[0].split(",").map((a) => a.trim()) });
+    keyOfId.set(id, k);
     return k;
   };
   const seeFull = (t) => see(t.isrc, t.id, `${t.artists.join(", ")} — ${t.name}`, t.artists);
   const lists = new Map(index.map((p) => [p.name, new Set(p.tracks.map(([id, isrc, label]) => see(isrc, id, label)))]));
   const liked = new Set(saved.tracks.map(seeFull));
   const ranks = tops.map((t) => new Map(t.items.map((x) => [seeFull(x), 1 - (x.rank - 1) / Math.max(t.items.length, 1)])));
-  const now = new Date().toISOString();
   const plays = new Map();
   for (const p of (await Promise.all(monthsBetween("2026-11", now).map((m) => readJson(playsPath(m))))).flat().filter(Boolean)) {
     const k = see(p.isrc, p.id, `${p.artists.join(", ")} — ${p.name}`, p.artists);
     plays.set(k, (plays.get(k) || 0) + 1);
   }
+  const members = new Set(targetData.tracks.map(seeFull));
 
-  // Positivos y examen (lo añadido desde cutoff no entrena: sirve para comprobar el modelo)
-  const positives = new Set();
-  const exam = new Set();
-  for (const t of targetData.tracks) (cutoff && (t.added_at || "") >= cutoff ? exam : positives).add(seeFull(t));
-  for (const k of positives) exam.delete(k);
-
-  // Universo: «Me gusta» se elige entre todo lo conocido; una playlist, dentro de `within` (por defecto «Me gusta»)
-  let universe;
-  if (targetIsLiked) universe = new Set(tracks.keys());
-  else {
-    const base = !within || LIKED_RE.test(within.trim()) ? liked : new Set((await getPlaylistTracks(within)).tracks.map(seeFull));
-    universe = new Set([...base, ...positives, ...exam]);
-  }
-  const keys = [...universe];
+  // Veredictos: se guardan los nuevos y se usan todos los de esta lista (el más reciente manda)
+  const resolve = (raw) => {
+    if (ISRC_RE.test(raw)) return raw.toUpperCase();
+    const id = toTrackUris([raw])[0].split(":")[2];
+    return keyOfId.get(id) || id;
+  };
+  const stored = (await readJson(FEEDBACK_PATH)) || [];
+  const fresh = [...yes.map((r) => [r, "yes"]), ...no.map((r) => [r, "no"])].map(([raw, verdict]) => {
+    const key = resolve(raw);
+    return { at: now, list: targetName, verdict, key, id: tracks.get(key)?.id ?? null, label: tracks.get(key)?.label ?? null };
+  });
+  if (fresh.length) await writeJson(FEEDBACK_PATH, [...stored, ...fresh]);
+  const labels = new Map(); // clave -> 1 | 0
+  let fromAdditions = 0;
+  for (const t of targetData.tracks) if ((t.added_at || "") >= sinceDate) labels.set(seeFull(t), 1), fromAdditions++;
+  const verdicts = [...stored, ...fresh].filter((f) => f.list === targetName);
+  for (const f of verdicts) labels.set(f.key, f.verdict === "yes" ? 1 : 0);
 
   // Excluidas por género: las de esas playlists, los títulos que las nombran y los artistas que viven en ellas
   const banned = new Set();
@@ -794,77 +806,119 @@ async function recommend({ target, within, exclude = [], cutoff, top = 30 } = {}
     for (const [k, t] of tracks) if (tagged.has(k) || t.artists.some((a) => perArtist.get(a)[0] >= 3 && perArtist.get(a)[1] / perArtist.get(a)[0] >= 0.6)) banned.add(k);
   }
 
-  // Señales
+  // De dónde salen las candidatas: «Me gusta», de todo lo conocido; una playlist, de `within` (por defecto «Me gusta»)
+  const pool = targetIsLiked
+    ? new Set(tracks.keys())
+    : !within || LIKED_RE.test(within.trim())
+      ? liked
+      : new Set((await getPlaylistTracks(within)).tracks.map(seeFull));
+  const keys = [...new Set([...pool, ...members, ...[...labels.keys()].filter((k) => tracks.has(k))])];
+  const rowOf = new Map(keys.map((k, i) => [k, i]));
+  const trainRows = [...labels.keys()].filter((k) => rowOf.has(k)).map((k) => rowOf.get(k));
+  const labelOf = (i) => labels.get(keys[i]);
+
+  // Señales. Las afinidades no cuentan la propia canción.
+  const count = (set) => {
+    const m = new Map();
+    for (const [k, t] of tracks) for (const a of t.artists) {
+      const c = m.get(a) || m.set(a, [0, 0]).get(a);
+      c[0]++;
+      if (set.has(k)) c[1]++;
+    }
+    return m;
+  };
+  const yesSet = new Set([...labels].filter(([, v]) => v === 1).map(([k]) => k));
+  const affinity = (m, set, k) => Math.max(...tracks.get(k).artists.map((a) => (m.get(a)[1] - (set.has(k) ? 1 : 0) + 0.5) / (m.get(a)[0] - 1 + 5)));
+  const byLiked = count(liked);
+  const byYes = count(yesSet);
+  const labeled = trainRows.map((i) => keys[i]);
   const tags = [...lists.entries()]
     .filter(([name, set]) => name !== targetName && set.size >= 30)
-    .map(([name, set]) => [name, set, keys.reduce((n, k) => n + set.has(k), 0)])
-    .filter(([, , inside]) => inside >= 10 && inside <= 0.9 * keys.length) // sin las que lo contienen casi todo (p. ej. «Todas»)
-    .map(([name, set]) => [name, set]);
-  const names = ["top 4 semanas", "top 6 meses", "top 1 año", "nº de ventanas", "afinidad por artista", "escuchas registradas", ...tags.map(([n]) => `en «${n}»`)];
+    .filter(([, set]) => {
+      const inside = labeled.reduce((n, k) => n + set.has(k), 0);
+      return inside >= 8 && inside <= 0.9 * labeled.length; // solo playlists con ejemplos suficientes a favor y en contra
+    });
+  const otherLists = [...lists.entries()].filter(([name]) => name !== targetName);
+  const names = ["top 4 semanas", "top 6 meses", "top 1 año", "nº de ventanas", "afinidad por artista (guardadas)", "afinidad por artista (síes recientes)", "escuchas registradas", "nº de playlists", ...tags.map(([n]) => `en «${n}»`)];
   const d = names.length;
-  const byArtist = new Map();
-  for (const k of keys) for (const a of tracks.get(k).artists) {
-    const c = byArtist.get(a) || byArtist.set(a, [0, 0]).get(a);
-    c[0]++;
-    if (positives.has(k)) c[1]++;
-  }
   const X = new Float64Array(keys.length * d);
   const y = new Float64Array(keys.length);
   keys.forEach((k, i) => {
     const r = ranks.map((m) => m.get(k) || 0);
-    let aff = 0;
-    for (const a of tracks.get(k).artists) {
-      const [n, pos] = byArtist.get(a);
-      aff = Math.max(aff, (pos - (positives.has(k) ? 1 : 0) + 0.5) / (n - 1 + 5)); // sin contar la propia canción, y suavizado
-    }
-    X.set([...r, r.filter((v) => v > 0).length, aff, Math.log1p(plays.get(k) || 0), ...tags.map(([, set]) => (set.has(k) ? 1 : 0))], i * d);
-    y[i] = positives.has(k) ? 1 : 0;
+    X.set(
+      [...r, r.filter((v) => v > 0).length, affinity(byLiked, liked, k), affinity(byYes, yesSet, k), Math.log1p(plays.get(k) || 0), Math.log1p(otherLists.reduce((n, [, set]) => n + set.has(k), 0)), ...tags.map(([, set]) => (set.has(k) ? 1 : 0))],
+      i * d
+    );
+    y[i] = labels.get(k) === 1 ? 1 : 0;
   });
 
-  const trainRows = keys.map((_, i) => i).filter((i) => !exam.has(keys[i]));
-  const nPos = trainRows.reduce((n, i) => n + y[i], 0);
-  if (nPos < 10 || nPos === trainRows.length) throw new Error(`«${targetName}» tiene ${nPos} ejemplos utilizables: hacen falta al menos 10 y que no sea todo el universo.`);
+  const nYes = trainRows.filter((i) => labelOf(i) === 1).length;
+  const nNo = trainRows.length - nYes;
+  const line = (i, score) => `${score.toFixed(2)} ${tracks.get(keys[i]).id} ${tracks.get(keys[i]).label}`;
+  const diverse = (rows, n) => {
+    const perArtist = new Map();
+    const out = [];
+    for (const i of rows) {
+      const a = tracks.get(keys[i]).artists[0];
+      if ((perArtist.get(a) || 0) >= 2) continue; // como mucho dos por artista: preguntas variadas
+      perArtist.set(a, (perArtist.get(a) || 0) + 1);
+      out.push(i);
+      if (out.length >= n) break;
+    }
+    return out;
+  };
+  const open = keys.map((_, i) => i).filter((i) => !members.has(keys[i]) && !labels.has(keys[i]) && !banned.has(keys[i]) && pool.has(keys[i]));
+  const head = {
+    target: targetName,
+    labels: { yes: nYes, no: nNo, from_verdicts: verdicts.length, from_additions_since: `${fromAdditions} (${sinceDate})`, recorded_now: fresh.length },
+    ...(pending.length ? { pending_playlists: pending } : {}),
+    excluded_by_genre: banned.size,
+  };
 
-  // Validación: 5 pliegues estratificados
-  const cv = new Float64Array(keys.length);
-  const folds = [[], [], [], [], []];
-  for (const cls of [1, 0]) seededShuffle(trainRows.filter((i) => y[i] === cls)).forEach((i, n) => folds[n % 5].push(i));
-  for (let f = 0; f < 5; f++) {
-    const m = fitLogistic(X, y, folds.flatMap((rows, n) => (n === f ? [] : rows)), d);
-    for (const i of folds[f]) cv[i] = m.score(i);
+  if (nYes < 8 || nNo < 8) {
+    // Sin ejemplos suficientes de ambos tipos no se entrena: se pregunta por lo que más suena ahora
+    const heur = (i) => X[i * d] + X[i * d + 1] + 0.5 * X[i * d + 2] + X[i * d + 5];
+    return {
+      ...head,
+      model: `sin entrenar: hacen falta al menos 8 síes y 8 noes recientes (hay ${nYes} y ${nNo})`,
+      ask: diverse(open.slice().sort((a, b) => heur(b) - heur(a)), ask).map((i) => line(i, heur(i))),
+    };
   }
-  const cvScores = trainRows.map((i) => cv[i]);
-  const cvLabels = trainRows.map((i) => y[i]);
-  const topN = trainRows.slice().sort((a, b) => cv[b] - cv[a]).slice(0, nPos);
 
-  // Modelo final
-  const m = fitLogistic(X, y, trainRows, d);
+  // Validación: pliegues estratificados sobre las decisiones recientes
+  const folds = Array.from({ length: Math.min(5, nYes, nNo) }, () => []);
+  for (const cls of [1, 0]) seededShuffle(trainRows.filter((i) => labelOf(i) === cls)).forEach((i, n) => folds[n % folds.length].push(i));
+  const cv = new Map();
+  const opts = { l2: 0.05, iters: 400 };
+  for (let f = 0; f < folds.length; f++) {
+    const m = fitLogistic(X, y, folds.flatMap((rows, n) => (n === f ? [] : rows)), d, opts);
+    for (const i of folds[f]) cv.set(i, m.score(i));
+  }
+  const hits = trainRows.filter((i) => cv.get(i) >= 0.5 === (labelOf(i) === 1)).length;
+
+  const m = fitLogistic(X, y, trainRows, d, opts);
   const final = keys.map((_, i) => m.score(i));
-  const order = keys.map((_, i) => i).sort((a, b) => final[b] - final[a]);
-  const pct = new Map(order.map((i, r) => [i, 1 - r / keys.length]));
-  const examPct = keys.map((k, i) => (exam.has(k) ? pct.get(i) : null)).filter((v) => v != null).sort((a, b) => a - b);
   const why = (i) => {
     const c = m.contrib(i);
     return c.map((v, j) => [v, j]).filter(([v, j]) => v > 0.05 && X[i * d + j] > 0).sort((a, b) => b[0] - a[0]).slice(0, 3).map(([, j]) => names[j]).join(", ") || "—";
   };
-  const line = (i, score) => `${score.toFixed(2)} ${tracks.get(keys[i]).id} ${tracks.get(keys[i]).label}`;
-
+  const byScore = open.slice().sort((a, b) => final[b] - final[a]);
+  const candidates = byScore.slice(0, top);
+  const shown = new Set(candidates);
   return {
-    target: targetName,
-    universe: keys.length,
-    in_list: nPos,
-    ...(pending.length ? { pending_playlists: pending } : {}),
+    ...head,
     validation: {
-      method: "se esconde una quinta parte de la lista cada vez y se mide cuánta recupera el modelo",
-      auc: round(aucOf(cvScores, cvLabels)),
-      recovered_in_top_n: round(topN.reduce((n, i) => n + y[i], 0) / nPos),
-      random_baseline: round(nPos / trainRows.length, 3),
+      method: `${folds.length} pliegues sobre tus decisiones recientes: se esconde una parte y se predice`,
+      auc: round(aucOf(trainRows.map((i) => cv.get(i)), trainRows.map((i) => (labelOf(i) === 1 ? 1 : 0)))),
+      accuracy: round(hits / trainRows.length),
+      baseline_accuracy: round(Math.max(nYes, nNo) / trainRows.length),
     },
-    ...(cutoff ? { exam: { since: cutoff, tracks: examPct.length, median_percentile: round(examPct[Math.floor(examPct.length / 2)] ?? null), share_in_top_10pct: examPct.length ? round(examPct.filter((v) => v >= 0.9).length / examPct.length) : null } } : {}),
     signals: Array.from(m.w, (w, j) => [names[j], round(w)]).sort((a, b) => Math.abs(b[1]) - Math.abs(a[1])).slice(0, 12).map(([n, w]) => `${n} ${w > 0 ? "+" : ""}${w}`),
-    excluded_by_genre: banned.size,
-    candidates: order.filter((i) => !positives.has(keys[i]) && !exam.has(keys[i]) && !banned.has(keys[i])).slice(0, top).map((i) => `${line(i, final[i])} | ${why(i)}`),
-    weakest_in_list: trainRows.filter((i) => y[i]).sort((a, b) => cv[a] - cv[b]).slice(0, top).map((i) => line(i, cv[i])),
+    candidates: candidates.map((i) => `${line(i, final[i])} | ${why(i)}`),
+    // Las dudosas: donde tu respuesta enseña más al modelo
+    ask: diverse(open.filter((i) => !shown.has(i)).sort((a, b) => Math.abs(final[a] - 0.5) - Math.abs(final[b] - 0.5)), ask).map((i) => line(i, final[i])),
+    // De lo que ya estaba en la lista sin decisión reciente, lo que menos se parece a lo que eliges ahora
+    review_in_list: keys.map((_, i) => i).filter((i) => members.has(keys[i]) && !labels.has(keys[i])).sort((a, b) => final[a] - final[b]).slice(0, top).map((i) => line(i, final[i])),
   };
 }
 
@@ -872,6 +926,19 @@ async function recommend({ target, within, exclude = [], cutoff, top = 30 } = {}
 // Algunos clientes envían los booleanos como texto ("true"/"false") cuando aún no conocen el parámetro
 const bool = (description) =>
   z.preprocess((v) => (v === "true" ? true : v === "false" ? false : v), z.boolean().optional()).describe(description);
+
+// Listas de texto: también se aceptan como JSON o separadas por comas (clientes que aún no conocen el parámetro)
+const strings = (description) =>
+  z
+    .preprocess((v) => {
+      if (typeof v !== "string") return v;
+      try {
+        const parsed = JSON.parse(v);
+        if (Array.isArray(parsed)) return parsed;
+      } catch {}
+      return v.split(",").map((x) => x.trim()).filter(Boolean);
+    }, z.array(z.string()).optional())
+    .describe(description);
 
 const PAGING = {
   limit: z.number().int().min(1).optional().describe("Máximo de canciones a devolver. Por defecto, todas."),
@@ -886,7 +953,7 @@ const SETS = {
 const DUPLICATES = bool("true = solo las grabaciones repetidas (mismo ISRC), agrupadas y con la más antigua primero.");
 
 function buildMcpServer() {
-  const server = new McpServer({ name: "spotify-playlists", version: "1.4.0" });
+  const server = new McpServer({ name: "spotify-playlists", version: "1.5.0" });
 
   server.registerTool(
     "list_playlists",
@@ -1071,15 +1138,18 @@ function buildMcpServer() {
     "recommend",
     {
       title: "Recomendaciones para una lista",
-      description: "Motor de recomendación. Aprende qué canciones están en la lista objetivo («me_gusta» o una playlist) a partir de: posición en los tres tops, en cuántos aparece, afinidad por artista, escuchas registradas y en qué playlists propias está. Devuelve la validación (esconde una quinta parte de la lista y mide cuánta recupera; fíate de las propuestas solo si es claramente mejor que el azar), las señales que más pesan, candidatas a entrar con el motivo y las canciones de la lista con menos apoyo en los datos (para revisar, no para quitar a ciegas). Solo lee: no cambia nada en Spotify.",
+      description: "Motor de recomendación guiado por tus decisiones recientes. Aprende SOLO de veredictos fechados (yes/no, que esta misma herramienta guarda) y de lo añadido a la lista desde `since`; lo que ya estaba en la lista no se da por bueno, porque las listas pueden estar anticuadas. Señales: los tres tops, afinidad por artista, escuchas registradas y playlists propias. Devuelve validación sobre esas decisiones, candidatas con motivo, `ask` (las más dudosas: enséñaselas al usuario y registra su respuesta con yes/no en la siguiente llamada) y `review_in_list` (lo de la lista que menos encaja con lo que elige ahora). Es una ayuda para decidir qué preguntar: el gusto lo decide el usuario. No cambia nada en Spotify; solo guarda los veredictos.",
       inputSchema: {
         target: z.string().describe('Lista objetivo: "me_gusta" o el nombre, id o enlace de una playlist (p. ej. "Perfection").'),
         within: z.string().optional().describe('De dónde salen las candidatas cuando target es una playlist. Por defecto "me_gusta". Se ignora si target es me_gusta (ahí se usa todo lo conocido).'),
-        exclude: z.array(z.string()).optional().describe('Playlists propias que marcan un género vetado, p. ej. ["Bachata"]. Se excluyen de las candidatas sus canciones, los títulos que las nombran y los artistas con la mayoría de sus canciones en ellas.'),
-        cutoff: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().describe("AAAA-MM-DD. Lo añadido a la lista desde ese día no se usa para entrenar y sirve de examen."),
+        exclude: strings('Playlists propias que marcan un género vetado, p. ej. ["Bachata"]. Se excluyen sus canciones, los títulos que las nombran y los artistas con la mayoría de sus canciones en ellas.'),
+        since: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().describe("AAAA-MM-DD. Lo añadido a la lista desde ese día cuenta como sí reciente. Por defecto, hace un año."),
+        yes: strings("Veredictos nuevos a guardar: canciones (ids, uris, enlaces o ISRC) que el usuario SÍ quiere en la lista."),
+        no: strings("Veredictos nuevos a guardar: canciones que el usuario NO quiere en la lista."),
         top: z.coerce.number().int().min(1).max(200).optional().describe("Cuántas candidatas y cuántas a revisar (por defecto 30)."),
+        ask: z.coerce.number().int().min(0).max(100).optional().describe("Cuántas dudosas proponer para preguntar (por defecto 20)."),
       },
-      annotations: { readOnlyHint: true },
+      annotations: { readOnlyHint: false, destructiveHint: false },
     },
     async (args) => json(await recommend(args))
   );
