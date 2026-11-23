@@ -38,6 +38,10 @@ Spotify solo devuelve las últimas 50 reproducciones, así que el servidor las v
 
 `/cron/log-plays` no devuelve datos. Si defines `CRON_SECRET` en Vercel, exige `Authorization: Bearer <valor>` (Vercel Cron lo envía solo; añade el mismo secreto en GitHub).
 
+## Exportar una copia
+
+`https://TU-PROYECTO.vercel.app/export/TU_MCP_SECRET` descarga un JSON con «Me gusta», los tres tops, el índice de tus playlists y el registro de escuchas, para analizarlo fuera del servidor. Añade `?playlists=Nombre1,Nombre2` para incluir el detalle (con fecha de alta) de esas playlists.
+
 ## Otras opciones
 
 - **En local:** `npm install`, rellena `.env` y ejecuta `node --env-file=.env server.js`.
