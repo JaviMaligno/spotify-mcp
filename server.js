@@ -900,7 +900,8 @@ async function recommend({ target, within, exclude = [], since, yes = [], no = [
   const final = keys.map((_, i) => m.score(i));
   const why = (i) => {
     const c = m.contrib(i);
-    return c.map((v, j) => [v, j]).filter(([v, j]) => v > 0.05 && X[i * d + j] > 0).sort((a, b) => b[0] - a[0]).slice(0, 3).map(([, j]) => names[j]).join(", ") || "—";
+    // Solo señales con peso a favor que la canción tiene: «le favorece tener poco de X» no es un motivo legible
+    return c.map((v, j) => [v, j]).filter(([v, j]) => v > 0.05 && m.w[j] > 0 && X[i * d + j] > 0).sort((a, b) => b[0] - a[0]).slice(0, 3).map(([, j]) => names[j]).join(", ") || "—";
   };
   const byScore = open.slice().sort((a, b) => final[b] - final[a]);
   const candidates = byScore.slice(0, top);
