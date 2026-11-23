@@ -666,6 +666,208 @@ async function findInPlaylists({ tracks = [], playlist } = {}) {
   };
 }
 
+// ---------- Motor de recomendación ----------
+// Aprende de las decisiones explícitas (qué está en la lista objetivo) con una regresión logística
+// y se valida escondiendo una quinta parte de la lista cada vez. No modifica nada en Spotify.
+const sigmoid = (z) => 1 / (1 + Math.exp(-z));
+
+function fitLogistic(X, y, rows, d, { iters = 300, lr = 1, l2 = 0.01 } = {}) {
+  const n = rows.length;
+  const mean = new Float64Array(d);
+  const std = new Float64Array(d);
+  for (const r of rows) for (let j = 0; j < d; j++) mean[j] += X[r * d + j];
+  for (let j = 0; j < d; j++) mean[j] /= n;
+  for (const r of rows) for (let j = 0; j < d; j++) std[j] += (X[r * d + j] - mean[j]) ** 2;
+  for (let j = 0; j < d; j++) std[j] = Math.sqrt(std[j] / n) || 1;
+  let pos = 0;
+  for (const r of rows) pos += y[r];
+  const wPos = n / (2 * Math.max(pos, 1)); // clases equilibradas: la lista suele ser una fracción pequeña
+  const wNeg = n / (2 * Math.max(n - pos, 1));
+  const w = new Float64Array(d);
+  let b = 0;
+  const g = new Float64Array(d);
+  for (let it = 0; it < iters; it++) {
+    g.fill(0);
+    let gb = 0;
+    for (const r of rows) {
+      let z = b;
+      for (let j = 0; j < d; j++) z += w[j] * ((X[r * d + j] - mean[j]) / std[j]);
+      const e = (sigmoid(z) - y[r]) * (y[r] ? wPos : wNeg);
+      gb += e;
+      for (let j = 0; j < d; j++) g[j] += e * ((X[r * d + j] - mean[j]) / std[j]);
+    }
+    for (let j = 0; j < d; j++) w[j] -= lr * (g[j] / n + l2 * w[j]);
+    b -= lr * (gb / n);
+  }
+  const contrib = (r) => Array.from(w, (wj, j) => wj * ((X[r * d + j] - mean[j]) / std[j]));
+  const score = (r) => sigmoid(b + contrib(r).reduce((a, c) => a + c, 0));
+  return { w, score, contrib };
+}
+
+function aucOf(scores, labels) {
+  const order = scores.map((s, i) => [s, labels[i]]).sort((a, b) => a[0] - b[0]);
+  let rankSum = 0;
+  let pos = 0;
+  for (let i = 0; i < order.length; ) {
+    let j = i;
+    while (j < order.length && order[j][0] === order[i][0]) j++;
+    const avg = (i + 1 + j) / 2; // rango medio en los empates
+    for (let k = i; k < j; k++) if (order[k][1]) (rankSum += avg), pos++;
+    i = j;
+  }
+  const neg = order.length - pos;
+  return pos && neg ? (rankSum - (pos * (pos + 1)) / 2) / (pos * neg) : null;
+}
+
+function seededShuffle(arr, seed = 7) {
+  let a = seed;
+  const rnd = () => ((a = (a + 0x6d2b79f5) | 0), (((Math.imul(a ^ (a >>> 15), 1 | a) ^ (a >>> 7)) >>> 0) / 4294967296));
+  const out = [...arr];
+  for (let i = out.length - 1; i > 0; i--) {
+    const j = Math.floor(rnd() * (i + 1));
+    [out[i], out[j]] = [out[j], out[i]];
+  }
+  return out;
+}
+
+const round = (x, n = 2) => (x == null ? null : Number(x.toFixed(n)));
+
+async function recommend({ target, within, exclude = [], cutoff, top = 30 } = {}) {
+  needBlob("El motor de recomendación");
+  const targetIsLiked = LIKED_RE.test(target.trim());
+  const [{ index, pending }, saved, ...tops] = await Promise.all([
+    loadIndex(25_000),
+    getSavedTracks(),
+    getTop("tracks", "short_term", 500),
+    getTop("tracks", "medium_term", 500),
+    getTop("tracks", "long_term", 500),
+  ]);
+  const targetData = targetIsLiked ? saved : await getPlaylistTracks(target);
+  const targetName = targetIsLiked ? "Me gusta" : targetData.name;
+
+  // Canciones conocidas, por ISRC (o id si no tiene)
+  const tracks = new Map(); // clave -> { id, label, artists }
+  const see = (isrc, id, label, artists) => {
+    const k = isrc?.toUpperCase() || id;
+    if (!tracks.has(k)) tracks.set(k, { id, label, artists: artists || label.split(" — ")[0].split(",").map((a) => a.trim()) });
+    return k;
+  };
+  const seeFull = (t) => see(t.isrc, t.id, `${t.artists.join(", ")} — ${t.name}`, t.artists);
+  const lists = new Map(index.map((p) => [p.name, new Set(p.tracks.map(([id, isrc, label]) => see(isrc, id, label)))]));
+  const liked = new Set(saved.tracks.map(seeFull));
+  const ranks = tops.map((t) => new Map(t.items.map((x) => [seeFull(x), 1 - (x.rank - 1) / Math.max(t.items.length, 1)])));
+  const now = new Date().toISOString();
+  const plays = new Map();
+  for (const p of (await Promise.all(monthsBetween("2026-11", now).map((m) => readJson(playsPath(m))))).flat().filter(Boolean)) {
+    const k = see(p.isrc, p.id, `${p.artists.join(", ")} — ${p.name}`, p.artists);
+    plays.set(k, (plays.get(k) || 0) + 1);
+  }
+
+  // Positivos y examen (lo añadido desde cutoff no entrena: sirve para comprobar el modelo)
+  const positives = new Set();
+  const exam = new Set();
+  for (const t of targetData.tracks) (cutoff && (t.added_at || "") >= cutoff ? exam : positives).add(seeFull(t));
+  for (const k of positives) exam.delete(k);
+
+  // Universo: «Me gusta» se elige entre todo lo conocido; una playlist, dentro de `within` (por defecto «Me gusta»)
+  let universe;
+  if (targetIsLiked) universe = new Set(tracks.keys());
+  else {
+    const base = !within || LIKED_RE.test(within.trim()) ? liked : new Set((await getPlaylistTracks(within)).tracks.map(seeFull));
+    universe = new Set([...base, ...positives, ...exam]);
+  }
+  const keys = [...universe];
+
+  // Excluidas por género: las de esas playlists, los títulos que las nombran y los artistas que viven en ellas
+  const banned = new Set();
+  for (const name of exclude) {
+    const set = lists.get(name) || new Set((await getPlaylistTracks(name)).tracks.map(seeFull));
+    const word = norm(name).replace(/[^a-z0-9]/g, "");
+    const tagged = new Set(set);
+    if (word.length >= 4) for (const [k, t] of tracks) if (norm(t.label).includes(word)) tagged.add(k);
+    const perArtist = new Map();
+    for (const [k, t] of tracks) for (const a of t.artists) {
+      const c = perArtist.get(a) || perArtist.set(a, [0, 0]).get(a);
+      c[0]++;
+      if (tagged.has(k)) c[1]++;
+    }
+    for (const [k, t] of tracks) if (tagged.has(k) || t.artists.some((a) => perArtist.get(a)[0] >= 3 && perArtist.get(a)[1] / perArtist.get(a)[0] >= 0.6)) banned.add(k);
+  }
+
+  // Señales
+  const tags = [...lists.entries()]
+    .filter(([name, set]) => name !== targetName && set.size >= 30)
+    .map(([name, set]) => [name, set, keys.reduce((n, k) => n + set.has(k), 0)])
+    .filter(([, , inside]) => inside >= 10 && inside <= 0.9 * keys.length) // sin las que lo contienen casi todo (p. ej. «Todas»)
+    .map(([name, set]) => [name, set]);
+  const names = ["top 4 semanas", "top 6 meses", "top 1 año", "nº de ventanas", "afinidad por artista", "escuchas registradas", ...tags.map(([n]) => `en «${n}»`)];
+  const d = names.length;
+  const byArtist = new Map();
+  for (const k of keys) for (const a of tracks.get(k).artists) {
+    const c = byArtist.get(a) || byArtist.set(a, [0, 0]).get(a);
+    c[0]++;
+    if (positives.has(k)) c[1]++;
+  }
+  const X = new Float64Array(keys.length * d);
+  const y = new Float64Array(keys.length);
+  keys.forEach((k, i) => {
+    const r = ranks.map((m) => m.get(k) || 0);
+    let aff = 0;
+    for (const a of tracks.get(k).artists) {
+      const [n, pos] = byArtist.get(a);
+      aff = Math.max(aff, (pos - (positives.has(k) ? 1 : 0) + 0.5) / (n - 1 + 5)); // sin contar la propia canción, y suavizado
+    }
+    X.set([...r, r.filter((v) => v > 0).length, aff, Math.log1p(plays.get(k) || 0), ...tags.map(([, set]) => (set.has(k) ? 1 : 0))], i * d);
+    y[i] = positives.has(k) ? 1 : 0;
+  });
+
+  const trainRows = keys.map((_, i) => i).filter((i) => !exam.has(keys[i]));
+  const nPos = trainRows.reduce((n, i) => n + y[i], 0);
+  if (nPos < 10 || nPos === trainRows.length) throw new Error(`«${targetName}» tiene ${nPos} ejemplos utilizables: hacen falta al menos 10 y que no sea todo el universo.`);
+
+  // Validación: 5 pliegues estratificados
+  const cv = new Float64Array(keys.length);
+  const folds = [[], [], [], [], []];
+  for (const cls of [1, 0]) seededShuffle(trainRows.filter((i) => y[i] === cls)).forEach((i, n) => folds[n % 5].push(i));
+  for (let f = 0; f < 5; f++) {
+    const m = fitLogistic(X, y, folds.flatMap((rows, n) => (n === f ? [] : rows)), d);
+    for (const i of folds[f]) cv[i] = m.score(i);
+  }
+  const cvScores = trainRows.map((i) => cv[i]);
+  const cvLabels = trainRows.map((i) => y[i]);
+  const topN = trainRows.slice().sort((a, b) => cv[b] - cv[a]).slice(0, nPos);
+
+  // Modelo final
+  const m = fitLogistic(X, y, trainRows, d);
+  const final = keys.map((_, i) => m.score(i));
+  const order = keys.map((_, i) => i).sort((a, b) => final[b] - final[a]);
+  const pct = new Map(order.map((i, r) => [i, 1 - r / keys.length]));
+  const examPct = keys.map((k, i) => (exam.has(k) ? pct.get(i) : null)).filter((v) => v != null).sort((a, b) => a - b);
+  const why = (i) => {
+    const c = m.contrib(i);
+    return c.map((v, j) => [v, j]).filter(([v, j]) => v > 0.05 && X[i * d + j] > 0).sort((a, b) => b[0] - a[0]).slice(0, 3).map(([, j]) => names[j]).join(", ") || "—";
+  };
+  const line = (i, score) => `${score.toFixed(2)} ${tracks.get(keys[i]).id} ${tracks.get(keys[i]).label}`;
+
+  return {
+    target: targetName,
+    universe: keys.length,
+    in_list: nPos,
+    ...(pending.length ? { pending_playlists: pending } : {}),
+    validation: {
+      method: "se esconde una quinta parte de la lista cada vez y se mide cuánta recupera el modelo",
+      auc: round(aucOf(cvScores, cvLabels)),
+      recovered_in_top_n: round(topN.reduce((n, i) => n + y[i], 0) / nPos),
+      random_baseline: round(nPos / trainRows.length, 3),
+    },
+    ...(cutoff ? { exam: { since: cutoff, tracks: examPct.length, median_percentile: round(examPct[Math.floor(examPct.length / 2)] ?? null), share_in_top_10pct: examPct.length ? round(examPct.filter((v) => v >= 0.9).length / examPct.length) : null } } : {}),
+    signals: Array.from(m.w, (w, j) => [names[j], round(w)]).sort((a, b) => Math.abs(b[1]) - Math.abs(a[1])).slice(0, 12).map(([n, w]) => `${n} ${w > 0 ? "+" : ""}${w}`),
+    excluded_by_genre: banned.size,
+    candidates: order.filter((i) => !positives.has(keys[i]) && !exam.has(keys[i]) && !banned.has(keys[i])).slice(0, top).map((i) => `${line(i, final[i])} | ${why(i)}`),
+    weakest_in_list: trainRows.filter((i) => y[i]).sort((a, b) => cv[a] - cv[b]).slice(0, top).map((i) => line(i, cv[i])),
+  };
+}
+
 // ---------- Servidor MCP ----------
 // Algunos clientes envían los booleanos como texto ("true"/"false") cuando aún no conocen el parámetro
 const bool = (description) =>
@@ -684,7 +886,7 @@ const SETS = {
 const DUPLICATES = bool("true = solo las grabaciones repetidas (mismo ISRC), agrupadas y con la más antigua primero.");
 
 function buildMcpServer() {
-  const server = new McpServer({ name: "spotify-playlists", version: "1.3.0" });
+  const server = new McpServer({ name: "spotify-playlists", version: "1.4.0" });
 
   server.registerTool(
     "list_playlists",
@@ -863,6 +1065,23 @@ function buildMcpServer() {
       annotations: { readOnlyHint: true },
     },
     async (args) => json(await findInPlaylists(args))
+  );
+
+  server.registerTool(
+    "recommend",
+    {
+      title: "Recomendaciones para una lista",
+      description: "Motor de recomendación. Aprende qué canciones están en la lista objetivo («me_gusta» o una playlist) a partir de: posición en los tres tops, en cuántos aparece, afinidad por artista, escuchas registradas y en qué playlists propias está. Devuelve la validación (esconde una quinta parte de la lista y mide cuánta recupera; fíate de las propuestas solo si es claramente mejor que el azar), las señales que más pesan, candidatas a entrar con el motivo y las canciones de la lista con menos apoyo en los datos (para revisar, no para quitar a ciegas). Solo lee: no cambia nada en Spotify.",
+      inputSchema: {
+        target: z.string().describe('Lista objetivo: "me_gusta" o el nombre, id o enlace de una playlist (p. ej. "Perfection").'),
+        within: z.string().optional().describe('De dónde salen las candidatas cuando target es una playlist. Por defecto "me_gusta". Se ignora si target es me_gusta (ahí se usa todo lo conocido).'),
+        exclude: z.array(z.string()).optional().describe('Playlists propias que marcan un género vetado, p. ej. ["Bachata"]. Se excluyen de las candidatas sus canciones, los títulos que las nombran y los artistas con la mayoría de sus canciones en ellas.'),
+        cutoff: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().describe("AAAA-MM-DD. Lo añadido a la lista desde ese día no se usa para entrenar y sirve de examen."),
+        top: z.coerce.number().int().min(1).max(200).optional().describe("Cuántas candidatas y cuántas a revisar (por defecto 30)."),
+      },
+      annotations: { readOnlyHint: true },
+    },
+    async (args) => json(await recommend(args))
   );
 
   server.registerTool(
