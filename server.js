@@ -975,6 +975,110 @@ async function recommend({ target, within, exclude = [], since, yes = [], no = [
   };
 }
 
+// ---------- Playlist de revisión («Dudas») ----------
+// Canciones que el usuario no recuerda bien: las escucha cuando quiere y cada pasada resuelve y repone.
+//   Sale como «sí»: la guardó en «Me gusta» (o ya lo estaba al entrar, la escuchó y la mantiene).
+//   Sale como «no»: la quitó él de la playlist, le quitó el «Me gusta», o la escuchó y no la guardó.
+//   Se queda: todavía no la ha escuchado (Spotify solo registra escuchas de ~30 s o más, no los saltos).
+// Después se rellena desde la cola hasta `size`. El estado vive en Blob.
+const REVIEW_PATH = "spotify/review.json";
+
+async function rotateReview({ playlist = "Dudas", enqueue = [], size = 50, dry_run = false } = {}) {
+  needBlob("La playlist de revisión");
+  const state = (await readJson(REVIEW_PATH)) || { queue: [], members: {}, log: [] };
+  const now = new Date().toISOString();
+  const labelOf = (t) => `${t.artists.join(", ")} — ${t.name}`;
+
+  // Encolar (sin repetir lo que ya está en cola, en la playlist o resuelto)
+  const known = new Set([...state.queue, ...Object.keys(state.members), ...state.log.map((l) => l.id)]);
+  let enqueued = 0;
+  for (const raw of enqueue) {
+    const id = toTrackUris([raw])[0].split(":")[2];
+    if (known.has(id)) continue;
+    state.queue.push(id);
+    known.add(id);
+    enqueued++;
+  }
+
+  const data = await getPlaylistTracks(playlist);
+  const current = new Map(data.tracks.map((t) => [t.id, t]));
+  const saved = await loadAllSaved();
+  const likedIds = new Set(saved.map((t) => t.id));
+  const likedIsrcs = new Set(saved.map(isrcKey).filter(Boolean));
+  const isLiked = (t) => likedIds.has(t.id) || (isrcKey(t) ? likedIsrcs.has(isrcKey(t)) : false);
+
+  await logPlays({ force: true }).catch((err) => console.warn("Registro de escuchas:", err.message));
+  const oldest = [...Object.values(state.members).map((m) => m.added_at), ...data.tracks.map((t) => t.added_at || now)].sort()[0] || now;
+  const plays = (await Promise.all(monthsBetween(oldest, now).map((m) => readJson(playsPath(m))))).flat().filter(Boolean);
+  const heardSince = (t, since) => plays.some((p) => p.played_at > since && (p.id === t.id || (p.isrc && isrcKey(t) && p.isrc.toUpperCase() === isrcKey(t))));
+
+  const resolved = [];
+  const resolve = (id, label, outcome, reason) => {
+    resolved.push({ id, label, outcome, reason });
+    state.log.push({ at: now, id, label, outcome, reason });
+    delete state.members[id];
+  };
+  // Las que el usuario quitó a mano
+  for (const [id, m] of Object.entries(state.members)) if (!current.has(id)) resolve(id, m.label, "no", "la quitaste de la playlist");
+
+  const toRemove = [];
+  let waiting = 0;
+  for (const [id, t] of current) {
+    const m = (state.members[id] ||= { added_at: t.added_at || now, label: labelOf(t), liked_at_entry: isLiked(t) });
+    const liked = isLiked(t);
+    const heard = heardSince(t, m.added_at);
+    let verdict;
+    if (m.liked_at_entry) {
+      if (!liked) verdict = ["no", "le quitaste el «Me gusta»"];
+      else if (heard) verdict = ["sí", "la escuchaste y sigue en «Me gusta»"];
+    } else if (liked) verdict = ["sí", "la guardaste en «Me gusta»"];
+    else if (heard) verdict = ["no", "la escuchaste y no la guardaste"];
+    if (verdict) {
+      toRemove.push(id);
+      resolve(id, m.label, ...verdict);
+    } else waiting++;
+  }
+
+  // Reponer desde la cola hasta el tamaño pedido
+  const adds = [];
+  const room = Math.max(0, size - waiting);
+  while (adds.length < room && state.queue.length) {
+    const id = state.queue.shift();
+    if (current.has(id) || likedIds.has(id)) {
+      state.log.push({ at: now, id, outcome: "omitida", reason: current.has(id) ? "ya estaba en la playlist" : "ya estaba en «Me gusta»" });
+      continue;
+    }
+    adds.push(id);
+  }
+
+  let added = adds;
+  if (!dry_run) {
+    if (toRemove.length) await removeTracks(data.id, toRemove);
+    if (adds.length) {
+      await addTracks(data.id, adds);
+      const after = await getPlaylistTracks(data.id);
+      added = [];
+      for (const t of after.tracks) {
+        if (!adds.includes(t.id) || state.members[t.id]) continue;
+        state.members[t.id] = { added_at: t.added_at || now, label: labelOf(t), liked_at_entry: false };
+        added.push(labelOf(t));
+      }
+    }
+    await writeJson(REVIEW_PATH, state);
+  }
+  return {
+    playlist: data.name,
+    ...(dry_run ? { dry_run: true, note: "simulación: no se ha cambiado nada" } : {}),
+    enqueued,
+    queue_left: state.queue.length,
+    in_playlist: waiting + adds.length,
+    waiting_unheard: waiting,
+    plays_logged_in_period: plays.length,
+    resolved: resolved.map((r) => `${r.outcome}: ${r.label} (${r.reason})`),
+    added,
+  };
+}
+
 // ---------- Servidor MCP ----------
 // Algunos clientes envían los booleanos como texto ("true"/"false") cuando aún no conocen el parámetro
 const bool = (description) =>
@@ -1006,7 +1110,7 @@ const SETS = {
 const DUPLICATES = bool("true = solo las grabaciones repetidas (mismo ISRC), agrupadas y con la más antigua primero.");
 
 function buildMcpServer() {
-  const server = new McpServer({ name: "spotify-playlists", version: "1.6.0" });
+  const server = new McpServer({ name: "spotify-playlists", version: "1.7.0" });
 
   server.registerTool(
     "list_playlists",
@@ -1221,6 +1325,22 @@ function buildMcpServer() {
       annotations: { readOnlyHint: false, destructiveHint: false },
     },
     async (args) => json(await recommend(args))
+  );
+
+  server.registerTool(
+    "rotate_review",
+    {
+      title: "Rotar la playlist de revisión (Dudas)",
+      description: "Mantiene una playlist de canciones que el usuario no recuerda bien. En cada pasada: saca como «sí» las que guardó en «Me gusta» (o que ya lo estaban, escuchó y mantiene); saca como «no» las que quitó él, a las que quitó el «Me gusta», o que escuchó sin guardar; deja las que aún no ha escuchado; y repone desde la cola hasta `size`. `enqueue` añade canciones a la cola. Devuelve qué salió y por qué, y qué entró. Usa dry_run para ver qué haría sin cambiar nada.",
+      inputSchema: {
+        playlist: z.string().optional().describe('Nombre, id o enlace de la playlist de revisión. Por defecto "Dudas".'),
+        enqueue: strings("Canciones (ids, uris o enlaces) que añadir a la cola de espera."),
+        size: z.coerce.number().int().min(1).max(500).optional().describe("Tamaño objetivo de la playlist (por defecto 50)."),
+        dry_run: bool("true = solo simular."),
+      },
+      annotations: { readOnlyHint: false, destructiveHint: true },
+    },
+    async (args) => json(await rotateReview(args))
   );
 
   server.registerTool(
