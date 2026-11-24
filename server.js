@@ -394,15 +394,29 @@ async function getPlaylistTracks(value, query, opts) {
   return { id: meta.id, name: meta.name, owner: meta.owner?.display_name, url: meta.external_urls?.spotify, total, ...(query ? { query } : {}), ...filterInfo(opts), ...(filtered ? { matches: out.length } : {}), ...shape(out, opts) };
 }
 
-async function addTracks(value, tracks, position) {
-  const { id } = await resolvePlaylist(value);
-  const uris = toTrackUris(tracks);
+async function createPlaylist(name, description, isPublic = false) {
+  const p = await spotify("/me/playlists", { method: "POST", body: { name, public: isPublic, ...(description ? { description } : {}) } });
+  return { id: p.id, name: p.name, public: p.public, url: p.external_urls?.spotify };
+}
+
+async function addTracks(value, tracks, position, create = false) {
+  const uris = toTrackUris(tracks); // validar antes de crear nada
+  let created;
+  let id;
+  try {
+    ({ id } = await resolvePlaylist(value));
+  } catch (err) {
+    // Solo se crea si no existe ninguna con ese nombre; con varias homónimas o un id inválido se mantiene el error
+    if (!create || !/^No encuentro/.test(err.message)) throw err;
+    created = await createPlaylist(String(value).trim());
+    id = created.id;
+  }
   for (let i = 0; i < uris.length; i += 100) {
     const body = { uris: uris.slice(i, i + 100) };
     if (position !== undefined) body.position = position + i; // 0 = al principio
     await spotify(`/playlists/${id}/items`, { method: "POST", body });
   }
-  return { playlist: id, added: uris.length, ...(position !== undefined ? { position } : {}), uris };
+  return { playlist: id, ...(created ? { created } : {}), added: uris.length, ...(position !== undefined ? { position } : {}), uris };
 }
 
 async function searchTracks(query, limit = 10) {
@@ -992,7 +1006,7 @@ const SETS = {
 const DUPLICATES = bool("true = solo las grabaciones repetidas (mismo ISRC), agrupadas y con la más antigua primero.");
 
 function buildMcpServer() {
-  const server = new McpServer({ name: "spotify-playlists", version: "1.5.0" });
+  const server = new McpServer({ name: "spotify-playlists", version: "1.6.0" });
 
   server.registerTool(
     "list_playlists",
@@ -1029,6 +1043,21 @@ function buildMcpServer() {
   );
 
   server.registerTool(
+    "create_playlist",
+    {
+      title: "Crear una playlist",
+      description: "Crea una playlist vacía en la cuenta del usuario (privada salvo que se indique public). Devuelve su id y enlace. Para crearla y llenarla de una vez, usa add_tracks con create.",
+      inputSchema: {
+        name: z.string().min(1).describe("Nombre de la playlist"),
+        description: z.string().optional().describe("Descripción. Opcional."),
+        public: bool("true = pública. Por defecto, privada."),
+      },
+      annotations: { readOnlyHint: false, destructiveHint: false },
+    },
+    async ({ name, description, public: isPublic }) => json(await createPlaylist(name, description, isPublic))
+  );
+
+  server.registerTool(
     "add_tracks",
     {
       title: "Añadir canciones a una playlist",
@@ -1037,11 +1066,12 @@ function buildMcpServer() {
         playlist: z.string().describe("Nombre exacto, id o enlace de la playlist"),
         tracks: z.array(z.string()).min(1).describe("Ids, uris o enlaces de las canciones"),
         position: z.number().int().min(0).optional().describe("Posición donde insertarlas, empezando en 0 (0 = al principio). Por defecto, al final."),
+        create: bool("true = si no existe ninguna playlist con ese nombre, crearla (privada) y añadirlas."),
       },
       annotations: { readOnlyHint: false, destructiveHint: false },
     },
-    async ({ playlist, tracks, position }) => {
-      const data = await addTracks(playlist, tracks, position);
+    async ({ playlist, tracks, position, create }) => {
+      const data = await addTracks(playlist, tracks, position, create);
       return { content: [{ type: "text", text: JSON.stringify(data) }] };
     }
   );

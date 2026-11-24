@@ -67,6 +67,7 @@ Sin parámetros exporta «Me gusta», los tops, el índice y el registro. Si Spo
 | `get_playlist_tracks` | Canciones de una playlist, con ISRC, duración y fecha en que se añadieron. `query` opcional para filtrar; `limit`/`offset` para paginar y `brief` para una línea por canción. |
 | `search_tracks` | Busca canciones en el catálogo de Spotify. |
 | `add_tracks` | Añade canciones a una playlist propia, al final o en la posición `position`. |
+| `create_playlist` | Crea una playlist vacía (privada por defecto). `add_tracks` con `create` la crea si no existe y la rellena. |
 | `remove_tracks` | Quita canciones de una playlist propia (todas las apariciones). |
 | `get_saved_tracks` | Canciones de «Me gusta». `query` opcional para filtrar; `limit`/`offset` y `brief` como arriba. |
 | `save_tracks` / `unsave_tracks` | Añade o quita canciones de «Me gusta» (usa `/me/library`, la API de febrero de 2026). |
