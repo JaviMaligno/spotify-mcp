@@ -1300,53 +1300,55 @@ app.get("/callback", async (req, res) => {
 <p>Spotify pedirá volver a iniciar sesión hacia el <b>${renewBy}</b>. No compartas este valor.</p>`));
 });
 
-// Copia de trabajo para análisis fuera del servidor: «Me gusta», los tres tops, el índice de playlists
-// propias y el registro de escuchas, en un solo JSON. ?playlists=A,B añade el detalle (con added_at) de esas playlists.
-async function buildSnapshot(detailed = []) {
-  // Cada parte se intenta por separado: si Spotify limita una (p. ej. «Me gusta»), el resto se exporta igual
+// Copia de trabajo en JSON para análisis fuera del servidor.
+// Solo se exporta lo que se pide:
+//   ?playlists=Perfection,Cool,me_gusta  listas con detalle (me_gusta es una más)
+//   ?include=tops,index,plays            los tres tops, el índice de todas las playlists propias y el registro de escuchas
+// Sin ningún parámetro se exporta todo (me_gusta, tops, índice y registro).
+async function buildSnapshot({ lists = [], include = [] } = {}) {
+  const all = !lists.length && !include.length;
+  const want = (part) => all || include.includes(part);
+  // Cada parte se intenta por separado: si Spotify limita una, el resto se exporta igual
   const errors = {};
   const attempt = (name, fn) => fn().catch((err) => ((errors[name] = err.message), null));
-  const [saved, short_term, medium_term, long_term] = await Promise.all([
-    attempt("saved", () => getSavedTracks()),
-    attempt("top.short_term", () => getTop("tracks", "short_term", 500)),
-    attempt("top.medium_term", () => getTop("tracks", "medium_term", 500)),
-    attempt("top.long_term", () => getTop("tracks", "long_term", 500)),
-  ]);
   const slim = ({ url, ...t }) => t;
-  let index = { index: [], pending: [] };
-  let plays = [];
-  if (hasBlob) {
-    index = (await attempt("playlists", () => loadIndex(40_000))) || index;
+  const out = { generated_at: new Date().toISOString(), errors };
+
+  const wantSaved = all || lists.some((n) => LIKED_RE.test(n));
+  if (wantSaved) {
+    const saved = await attempt("me_gusta", () => getSavedTracks());
+    out.saved = saved ? saved.tracks.map(slim) : null;
+  }
+  out.detail = {};
+  for (const name of lists.filter((n) => !LIKED_RE.test(n))) {
+    const data = await attempt(`detail.${name}`, () => getPlaylistTracks(name));
+    out.detail[name] = data ? data.tracks.map(slim) : null;
+  }
+  if (want("tops")) {
+    out.top = {};
+    for (const range of Object.keys(TIME_RANGES)) {
+      const top = await attempt(`top.${range}`, () => getTop("tracks", range, 500));
+      out.top[range] = top ? top.items.map(slim) : null;
+    }
+  }
+  if (want("index") && hasBlob) {
+    const index = await attempt("index", () => loadIndex(40_000));
+    out.playlists = index ? index.index : null; // [{ id, name, tracks: [[id, isrc, "Artistas — Título"], ...] }]
+    out.playlists_pending = index ? index.pending : null;
+  }
+  if (want("plays") && hasBlob) {
     await logPlays({ force: true }).catch(() => {});
     const now = new Date().toISOString();
-    plays = (await Promise.all(monthsBetween("2026-11", now).map((m) => readJson(playsPath(m))))).flat().filter(Boolean);
+    out.plays = (await Promise.all(monthsBetween("2026-11", now).map((m) => readJson(playsPath(m))))).flat().filter(Boolean);
   }
-  const detail = {};
-  for (const name of detailed) {
-    const data = await attempt(`detail.${name}`, () => getPlaylistTracks(name));
-    if (data) detail[name] = data.tracks.map(slim);
-  }
-  return {
-    generated_at: new Date().toISOString(),
-    errors, // partes que no se pudieron leer; su valor queda en null
-    saved: saved ? saved.tracks.map(slim) : null,
-    top: {
-      short_term: short_term ? short_term.items.map(slim) : null,
-      medium_term: medium_term ? medium_term.items.map(slim) : null,
-      long_term: long_term ? long_term.items.map(slim) : null,
-    },
-    playlists: index.index, // [{ id, name, tracks: [[id, isrc, "Artistas — Título"], ...] }]
-    playlists_pending: index.pending,
-    detail,
-    plays,
-  };
+  return out;
 }
 
 app.get(`/export/${MCP_SECRET}`, async (req, res) => {
   try {
-    const detailed = String(req.query.playlists || "").split(",").map((x) => x.trim()).filter(Boolean);
-    const snapshot = await buildSnapshot(detailed);
-    res.setHeader("Content-Disposition", `attachment; filename="spotify-snapshot-${snapshot.generated_at.slice(0, 10)}.json"`);
+    const list = (v) => String(v || "").split(",").map((x) => x.trim()).filter(Boolean);
+    const snapshot = await buildSnapshot({ lists: list(req.query.playlists), include: list(req.query.include).map((x) => x.toLowerCase()) });
+    res.setHeader("Content-Disposition", `attachment; filename="spotify-snapshot-${snapshot.generated_at.slice(0, 16).replace(/[T:]/g, "-")}.json"`);
     res.json(snapshot);
   } catch (err) {
     console.error("Exportación:", err);
