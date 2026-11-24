@@ -77,4 +77,5 @@ Sin parámetros exporta «Me gusta», los tops, el índice y el registro. Si Spo
 | `get_play_log` | Registro acumulado de escuchas: resumen por canción (veces, días, última vez, desde qué playlist) o lista cronológica con `detail`. Necesita Blob. |
 | `find_in_playlists` | En qué playlists propias está cada canción, comparando por ISRC. Indexa las playlists en Blob y solo vuelve a descargar las que cambian. |
 | `recommend` | Motor de recomendación guiado por decisiones recientes: aprende de los veredictos sí/no que guarda (`yes`, `no`) y de lo añadido a la lista desde `since`, no de lo que ya estaba. Devuelve candidatas, dudosas para preguntar y lo de la lista que menos encaja hoy. No cambia nada en Spotify. |
+| `rotate_review` | Rota una playlist de revisión («Dudas»): saca las canciones resueltas (guardadas, quitadas o escuchadas sin guardar), deja las no escuchadas y repone desde una cola. |
 | `auth_status` | Estado de la sesión y enlace para volver a iniciarla. |
