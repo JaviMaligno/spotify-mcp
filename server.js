@@ -1303,27 +1303,38 @@ app.get("/callback", async (req, res) => {
 // Copia de trabajo para análisis fuera del servidor: «Me gusta», los tres tops, el índice de playlists
 // propias y el registro de escuchas, en un solo JSON. ?playlists=A,B añade el detalle (con added_at) de esas playlists.
 async function buildSnapshot(detailed = []) {
+  // Cada parte se intenta por separado: si Spotify limita una (p. ej. «Me gusta»), el resto se exporta igual
+  const errors = {};
+  const attempt = (name, fn) => fn().catch((err) => ((errors[name] = err.message), null));
   const [saved, short_term, medium_term, long_term] = await Promise.all([
-    getSavedTracks(),
-    getTop("tracks", "short_term", 500),
-    getTop("tracks", "medium_term", 500),
-    getTop("tracks", "long_term", 500),
+    attempt("saved", () => getSavedTracks()),
+    attempt("top.short_term", () => getTop("tracks", "short_term", 500)),
+    attempt("top.medium_term", () => getTop("tracks", "medium_term", 500)),
+    attempt("top.long_term", () => getTop("tracks", "long_term", 500)),
   ]);
   const slim = ({ url, ...t }) => t;
   let index = { index: [], pending: [] };
   let plays = [];
   if (hasBlob) {
-    index = await loadIndex(40_000);
+    index = (await attempt("playlists", () => loadIndex(40_000))) || index;
     await logPlays({ force: true }).catch(() => {});
     const now = new Date().toISOString();
     plays = (await Promise.all(monthsBetween("2026-11", now).map((m) => readJson(playsPath(m))))).flat().filter(Boolean);
   }
   const detail = {};
-  for (const name of detailed) detail[name] = (await getPlaylistTracks(name)).tracks.map(slim);
+  for (const name of detailed) {
+    const data = await attempt(`detail.${name}`, () => getPlaylistTracks(name));
+    if (data) detail[name] = data.tracks.map(slim);
+  }
   return {
     generated_at: new Date().toISOString(),
-    saved: saved.tracks.map(slim),
-    top: { short_term: short_term.items.map(slim), medium_term: medium_term.items.map(slim), long_term: long_term.items.map(slim) },
+    errors, // partes que no se pudieron leer; su valor queda en null
+    saved: saved ? saved.tracks.map(slim) : null,
+    top: {
+      short_term: short_term ? short_term.items.map(slim) : null,
+      medium_term: medium_term ? medium_term.items.map(slim) : null,
+      long_term: long_term ? long_term.items.map(slim) : null,
+    },
     playlists: index.index, // [{ id, name, tracks: [[id, isrc, "Artistas — Título"], ...] }]
     playlists_pending: index.pending,
     detail,
