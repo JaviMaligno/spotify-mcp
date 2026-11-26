@@ -1140,6 +1140,7 @@ async function loadFeatures(ids, { budgetMs = 25_000, retryMissing = false } = {
 // prueban esos ids. Las candidatas se recuerdan en Blob para no repetir búsquedas.
 const ALT_PATH = "spotify/features-alt.json";
 let altMem; // { [id]: [idCandidato, ...] }
+const EDITIONS_PER_CALL = 30;
 const seconds = (d) => String(d || "").split(":").reduce((a, x) => a * 60 + Number(x), 0);
 
 async function findEditions(t) {
@@ -1160,12 +1161,12 @@ async function resolveMissing(list, budgetMs = 20_000) {
   const todo = missing.filter((t) => !(t.id in altMem));
   let searched = 0;
   let error;
-  for (let i = 0; i < todo.length && Date.now() - started < budgetMs; i += 4) {
-    const chunk = todo.slice(i, i + 4);
+  // De una en una, con pausa y tope por llamada: ~630 búsquedas en dos minutos le costaron a /search un bloqueo de 24 h.
+  for (let i = 0; i < todo.length && i < EDITIONS_PER_CALL && Date.now() - started < budgetMs; i++) {
     try {
-      const got = await Promise.all(chunk.map(findEditions));
-      chunk.forEach((t, k) => (altMem[t.id] = got[k]));
-      searched += chunk.length;
+      altMem[todo[i].id] = await findEditions(todo[i]);
+      searched++;
+      await new Promise((r) => setTimeout(r, 400));
     } catch (err) {
       error = err.message; // p. ej. límite de peticiones de Spotify: se guarda lo hecho y se sigue otro día
       break;
@@ -1258,7 +1259,7 @@ const SETS = {
 const DUPLICATES = bool("true = solo las grabaciones repetidas (mismo ISRC), agrupadas y con la más antigua primero.");
 
 function buildMcpServer() {
-  const server = new McpServer({ name: "spotify-playlists", version: "1.8.1" });
+  const server = new McpServer({ name: "spotify-playlists", version: "1.8.2" });
 
   server.registerTool(
     "list_playlists",
@@ -1502,7 +1503,7 @@ function buildMcpServer() {
         limit: z.coerce.number().int().min(0).max(500).optional().describe("Filas a devolver (por defecto 50; 0 = solo la cobertura)."),
         offset: z.coerce.number().int().min(0).optional().describe("Filas a saltar."),
         retry_missing: bool("true = volver a pedir las que antes no tenían datos."),
-        resolve: bool("true = para las canciones de la playlist que quedaron sin datos, buscar otras ediciones en Spotify (mismo ISRC o mismo título, artista y duración) y probar con ellas. Hace búsquedas en Spotify por tandas: repite mientras editions.to_search > 0."),
+        resolve: bool("true = para las canciones de la playlist que quedaron sin datos, buscar otras ediciones en Spotify (mismo ISRC o mismo título, artista y duración) y probar con ellas. Hace búsquedas en Spotify despacio (30 por llamada, para no agotar el límite de /search): repite, dejando tiempo entre llamadas, mientras editions.to_search > 0."),
       },
       annotations: { readOnlyHint: true, openWorldHint: true },
     },
