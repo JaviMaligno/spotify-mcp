@@ -1135,18 +1135,78 @@ async function loadFeatures(ids, { budgetMs = 25_000, retryMissing = false } = {
   return { features, pending, ...(error ? { error } : {}) };
 }
 
+// Muchas canciones de la biblioteca conservan ids antiguos que ReccoBeats no conoce. Para las que quedaron sin
+// datos se buscan en Spotify otras ediciones (mismo ISRC; si no hay, mismo título, artista y duración) y se
+// prueban esos ids. Las candidatas se recuerdan en Blob para no repetir búsquedas.
+const ALT_PATH = "spotify/features-alt.json";
+let altMem; // { [id]: [idCandidato, ...] }
+const seconds = (d) => String(d || "").split(":").reduce((a, x) => a * 60 + Number(x), 0);
+
+async function findEditions(t) {
+  const others = (found) => found.filter((x) => x.id && x.id !== t.id);
+  let found = t.isrc ? others(await searchTracks(`isrc:${t.isrc}`, 10)) : [];
+  if (!found.length && t.name && t.artists?.[0]) {
+    const clean = (x) => String(x).replace(/"/g, "");
+    const same = (x) => norm(x.name) === norm(t.name) && Math.abs(seconds(x.duration) - seconds(t.duration)) <= 3;
+    found = others(await searchTracks(`track:"${clean(t.name)}" artist:"${clean(t.artists[0])}"`, 10)).filter(same);
+  }
+  return found.slice(0, 6).map((x) => x.id);
+}
+
+async function resolveMissing(list, budgetMs = 20_000) {
+  const started = Date.now();
+  if (!altMem) altMem = (hasBlob && (await readJson(ALT_PATH).catch(() => null))) || {};
+  const missing = list.filter((t) => t.id && featuresMem[t.id] === null);
+  const todo = missing.filter((t) => !(t.id in altMem));
+  let searched = 0;
+  let error;
+  for (let i = 0; i < todo.length && Date.now() - started < budgetMs; i += 4) {
+    const chunk = todo.slice(i, i + 4);
+    try {
+      const got = await Promise.all(chunk.map(findEditions));
+      chunk.forEach((t, k) => (altMem[t.id] = got[k]));
+      searched += chunk.length;
+    } catch (err) {
+      error = err.message; // p. ej. límite de peticiones de Spotify: se guarda lo hecho y se sigue otro día
+      break;
+    }
+  }
+  const pool = missing.filter((t) => altMem[t.id]?.length);
+  const { features } = await loadFeatures(pool.flatMap((t) => altMem[t.id]), { budgetMs: 15_000 });
+  let recovered = 0;
+  for (const t of pool) {
+    const hit = altMem[t.id].find((id) => features[id]);
+    if (hit) {
+      featuresMem[t.id] = features[hit];
+      recovered++;
+    }
+  }
+  if (hasBlob && (searched || recovered)) {
+    await writeJson(ALT_PATH, altMem).catch((err) => console.warn("No se pudo guardar la caché de ediciones:", err.message));
+    await writeJson(FEATURES_PATH, featuresMem).catch((err) => console.warn("No se pudo guardar la caché de rasgos:", err.message));
+  }
+  return { searched, recovered, to_search: todo.length - searched, ...(error ? { error } : {}) };
+}
+
 const trackIdOf = (t) => toTrackUris([t])[0].split(":")[2];
 
-async function audioFeatures({ tracks = [], playlist, limit = 50, offset = 0, retry_missing = false } = {}) {
+async function audioFeatures({ tracks = [], playlist, limit = 50, offset = 0, retry_missing = false, resolve = false } = {}) {
   if (!tracks.length && !playlist) throw new Error("Indica tracks y/o playlist.");
   const labels = new Map();
   for (const t of tracks) labels.set(trackIdOf(t), null);
+  const objects = [];
   if (playlist) {
     const list = LIKED_RE.test(playlist) ? await loadAllSaved() : (await getPlaylistTracks(playlist)).tracks;
     for (const t of list) if (t.id) labels.set(t.id, `${(t.artists || []).join(", ")} — ${t.name}`);
+    objects.push(...list);
   }
   const ids = [...labels.keys()];
-  const { features, pending, error } = await loadFeatures(ids, { retryMissing: retry_missing });
+  let { features, pending, error } = await loadFeatures(ids, { retryMissing: retry_missing, budgetMs: resolve ? 8_000 : 25_000 });
+  let editions;
+  if (resolve && objects.length) {
+    editions = await resolveMissing(objects);
+    ({ features, pending } = await loadFeatures(ids, { budgetMs: 0 }));
+  }
   const known = ids.filter((id) => id in features);
   const withData = known.filter((id) => features[id]);
   const rows = ids.slice(offset, offset + limit).map((id) => {
@@ -1161,6 +1221,7 @@ async function audioFeatures({ tracks = [], playlist, limit = 50, offset = 0, re
     not_found: known.length - withData.length,
     pending,
     ...(pending ? { note: "Repite la llamada para completar los pendientes." } : {}),
+    ...(editions ? { editions } : {}),
     ...(error ? { error } : {}),
     columns: `id | ${FEATURE_KEYS.join(" ")} | canción`,
     offset,
@@ -1197,7 +1258,7 @@ const SETS = {
 const DUPLICATES = bool("true = solo las grabaciones repetidas (mismo ISRC), agrupadas y con la más antigua primero.");
 
 function buildMcpServer() {
-  const server = new McpServer({ name: "spotify-playlists", version: "1.8.0" });
+  const server = new McpServer({ name: "spotify-playlists", version: "1.8.1" });
 
   server.registerTool(
     "list_playlists",
@@ -1441,6 +1502,7 @@ function buildMcpServer() {
         limit: z.coerce.number().int().min(0).max(500).optional().describe("Filas a devolver (por defecto 50; 0 = solo la cobertura)."),
         offset: z.coerce.number().int().min(0).optional().describe("Filas a saltar."),
         retry_missing: bool("true = volver a pedir las que antes no tenían datos."),
+        resolve: bool("true = para las canciones de la playlist que quedaron sin datos, buscar otras ediciones en Spotify (mismo ISRC o mismo título, artista y duración) y probar con ellas. Hace búsquedas en Spotify por tandas: repite mientras editions.to_search > 0."),
       },
       annotations: { readOnlyHint: true, openWorldHint: true },
     },
@@ -1582,8 +1644,13 @@ async function buildSnapshot({ lists = [], include = [] } = {}) {
   // Rasgos de audio (ReccoBeats) de las listas pedidas. Solo si se pide: implica llamar a un servicio externo.
   if (include.includes("features")) {
     const ids = [...(out.saved || []), ...Object.values(out.detail).flatMap((l) => l || [])].map((t) => t.id).filter(Boolean);
-    const got = await attempt("features", () => loadFeatures(ids, { budgetMs: 40_000 }));
-    out.features = got ? { keys: FEATURE_KEYS, pending: got.pending, ...(got.error ? { error: got.error } : {}), tracks: got.features } : null;
+    const objects = [...(out.saved || []), ...Object.values(out.detail).flatMap((l) => l || [])];
+    const got = await attempt("features", async () => {
+      await loadFeatures(ids, { budgetMs: 15_000 });
+      const editions = include.includes("editions") ? await resolveMissing(objects, 25_000) : undefined;
+      return { ...(await loadFeatures(ids, { budgetMs: 0 })), editions };
+    });
+    out.features = got ? { keys: FEATURE_KEYS, pending: got.pending, ...(got.editions ? { editions: got.editions } : {}), ...(got.error ? { error: got.error } : {}), tracks: got.features } : null;
   }
   if (want("tops")) {
     out.top = {};

@@ -43,7 +43,7 @@ Spotify solo devuelve las últimas 50 reproducciones, así que el servidor las v
 `https://TU-PROYECTO.vercel.app/export/TU_MCP_SECRET` descarga un JSON para analizar fuera del servidor. Solo exporta lo que pidas:
 
 - `?playlists=Perfection,Cool,me_gusta`: esas listas con detalle (fecha de alta incluida). `me_gusta` es una más.
-- `?include=features`: rasgos de audio (ReccoBeats) de las canciones de las listas pedidas. No entra en la exportación sin parámetros.
+- `?include=features`: rasgos de audio (ReccoBeats) de las canciones de las listas pedidas. No entra en la exportación sin parámetros. Con `features,editions` busca además otras ediciones de las que quedaron sin datos.
 - `?include=tops,index,plays`: los tres tops, el índice de todas tus playlists y el registro de escuchas.
 
 Sin parámetros exporta «Me gusta», los tops, el índice y el registro. Si Spotify limita alguna parte, el resto se exporta igual y el motivo queda en `errors`.
