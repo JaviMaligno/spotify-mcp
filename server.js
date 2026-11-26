@@ -1081,6 +1081,93 @@ async function rotateReview({ playlist = "Dudas", enqueue = [], size = 50, dry_r
 
 // ---------- Servidor MCP ----------
 // Algunos clientes envían los booleanos como texto ("true"/"false") cuando aún no conocen el parámetro
+// ---------- Rasgos de audio (ReccoBeats) ----------
+// Spotify cerró /audio-features a las apps nuevas en noviembre de 2024. ReccoBeats da rasgos equivalentes
+// por id de Spotify y sin clave. Solo se le envían ids públicos de canciones. Se guardan en Blob para no repetir.
+const RECCO = "https://api.reccobeats.com/v1/audio-features";
+const FEATURES_PATH = "spotify/features.json";
+const FEATURE_KEYS = ["tempo", "key", "mode", "energy", "valence", "danceability", "acousticness", "instrumentalness", "speechiness", "liveness", "loudness"];
+let featuresMem; // { [id]: [..FEATURE_KEYS] | null }
+
+async function reccoBatch(ids) {
+  const res = await fetch(`${RECCO}?ids=${ids.join(",")}`, { headers: { Accept: "application/json" }, signal: AbortSignal.timeout(15_000) });
+  if (res.ok) {
+    const found = {};
+    for (const item of (await res.json()).content || []) {
+      const id = String(item.href || "").match(/track\/([A-Za-z0-9]{22})/)?.[1];
+      if (id) found[id] = FEATURE_KEYS.map((k) => (typeof item[k] === "number" ? Number(item[k].toFixed(3)) : null));
+    }
+    return Object.fromEntries(ids.map((id) => [id, found[id] ?? null]));
+  }
+  if (res.status === 429 || res.status >= 500) throw new Error(`ReccoBeats respondió ${res.status}`);
+  if (ids.length === 1) return { [ids[0]]: null }; // 4xx con un solo id: no lo tiene
+  const half = Math.ceil(ids.length / 2); // 4xx con varios: se parte el lote para aislar el id problemático
+  return { ...(await reccoBatch(ids.slice(0, half))), ...(await reccoBatch(ids.slice(half))) };
+}
+
+// Devuelve { features: {id: [...] | null}, pending } usando la caché y pidiendo lo que falte dentro del presupuesto de tiempo.
+async function loadFeatures(ids, { budgetMs = 25_000, retryMissing = false } = {}) {
+  const started = Date.now();
+  if (!featuresMem) featuresMem = (hasBlob && (await readJson(FEATURES_PATH).catch(() => null))) || {};
+  const unique = [...new Set(ids)];
+  const todo = unique.filter((id) => !(id in featuresMem) || (retryMissing && featuresMem[id] === null));
+  let fetched = 0;
+  let error;
+  for (let i = 0; i < todo.length && Date.now() - started < budgetMs; i += 120) {
+    const chunk = todo.slice(i, i + 120);
+    const batches = [];
+    for (let j = 0; j < chunk.length; j += 40) batches.push(chunk.slice(j, j + 40));
+    try {
+      for (const got of await Promise.all(batches.map(reccoBatch))) Object.assign(featuresMem, got);
+      fetched += chunk.length;
+    } catch (err) {
+      error = err.message;
+      break;
+    }
+  }
+  if (fetched && hasBlob) await writeJson(FEATURES_PATH, featuresMem).catch((err) => console.warn("No se pudo guardar la caché de rasgos:", err.message));
+  const features = {};
+  let pending = 0;
+  for (const id of unique) {
+    if (id in featuresMem) features[id] = featuresMem[id];
+    else pending++;
+  }
+  return { features, pending, ...(error ? { error } : {}) };
+}
+
+const trackIdOf = (t) => toTrackUris([t])[0].split(":")[2];
+
+async function audioFeatures({ tracks = [], playlist, limit = 50, offset = 0, retry_missing = false } = {}) {
+  if (!tracks.length && !playlist) throw new Error("Indica tracks y/o playlist.");
+  const labels = new Map();
+  for (const t of tracks) labels.set(trackIdOf(t), null);
+  if (playlist) {
+    const list = LIKED_RE.test(playlist) ? await loadAllSaved() : (await getPlaylistTracks(playlist)).tracks;
+    for (const t of list) if (t.id) labels.set(t.id, `${(t.artists || []).join(", ")} — ${t.name}`);
+  }
+  const ids = [...labels.keys()];
+  const { features, pending, error } = await loadFeatures(ids, { retryMissing: retry_missing });
+  const known = ids.filter((id) => id in features);
+  const withData = known.filter((id) => features[id]);
+  const rows = ids.slice(offset, offset + limit).map((id) => {
+    const f = features[id];
+    const label = labels.get(id);
+    return [id, f === undefined ? "pendiente" : f ? f.map((v) => v ?? "-").join(" ") : "sin datos", ...(label ? [label] : [])].join(" | ");
+  });
+  return {
+    source: "ReccoBeats",
+    total: ids.length,
+    with_features: withData.length,
+    not_found: known.length - withData.length,
+    pending,
+    ...(pending ? { note: "Repite la llamada para completar los pendientes." } : {}),
+    ...(error ? { error } : {}),
+    columns: `id | ${FEATURE_KEYS.join(" ")} | canción`,
+    offset,
+    rows,
+  };
+}
+
 const bool = (description) =>
   z.preprocess((v) => (v === "true" ? true : v === "false" ? false : v), z.boolean().optional()).describe(description);
 
@@ -1110,7 +1197,7 @@ const SETS = {
 const DUPLICATES = bool("true = solo las grabaciones repetidas (mismo ISRC), agrupadas y con la más antigua primero.");
 
 function buildMcpServer() {
-  const server = new McpServer({ name: "spotify-playlists", version: "1.7.0" });
+  const server = new McpServer({ name: "spotify-playlists", version: "1.8.0" });
 
   server.registerTool(
     "list_playlists",
@@ -1344,6 +1431,23 @@ function buildMcpServer() {
   );
 
   server.registerTool(
+    "audio_features",
+    {
+      title: "Rasgos de audio de las canciones",
+      description: "Tempo, tonalidad (key 0-11, mode 1 = mayor), energía, valencia, bailabilidad, acústica, instrumentalidad, habla, directo y volumen de cada canción. Spotify ya no los da a apps nuevas: se piden a ReccoBeats por id de Spotify (solo se envían ids públicos) y se guardan en caché. Pasa tracks y/o playlist (nombre, id, enlace o \"me_gusta\"). Devuelve la cobertura (with_features, not_found, pending) y las filas de la página pedida; si pending > 0, repite la llamada. Para listas grandes usa limit bajo y descarga los datos con /export?include=features.",
+      inputSchema: {
+        tracks: strings("Ids, uris o enlaces de canciones."),
+        playlist: z.string().optional().describe('Playlist cuyas canciones se quieren analizar, o "me_gusta".'),
+        limit: z.coerce.number().int().min(0).max(500).optional().describe("Filas a devolver (por defecto 50; 0 = solo la cobertura)."),
+        offset: z.coerce.number().int().min(0).optional().describe("Filas a saltar."),
+        retry_missing: bool("true = volver a pedir las que antes no tenían datos."),
+      },
+      annotations: { readOnlyHint: true, openWorldHint: true },
+    },
+    async (args) => json(await audioFeatures(args))
+  );
+
+  server.registerTool(
     "auth_status",
     {
       title: "Estado de la sesión de Spotify",
@@ -1453,6 +1557,7 @@ app.get("/callback", async (req, res) => {
 // Copia de trabajo en JSON para análisis fuera del servidor.
 // Solo se exporta lo que se pide:
 //   ?playlists=Perfection,Cool,me_gusta  listas con detalle (me_gusta es una más)
+//   ?include=features                    rasgos de audio (ReccoBeats) de las canciones de las listas pedidas
 //   ?include=tops,index,plays            los tres tops, el índice de todas las playlists propias y el registro de escuchas
 // Sin ningún parámetro se exporta todo (me_gusta, tops, índice y registro).
 async function buildSnapshot({ lists = [], include = [] } = {}) {
@@ -1473,6 +1578,12 @@ async function buildSnapshot({ lists = [], include = [] } = {}) {
   for (const name of lists.filter((n) => !LIKED_RE.test(n))) {
     const data = await attempt(`detail.${name}`, () => getPlaylistTracks(name));
     out.detail[name] = data ? data.tracks.map(slim) : null;
+  }
+  // Rasgos de audio (ReccoBeats) de las listas pedidas. Solo si se pide: implica llamar a un servicio externo.
+  if (include.includes("features")) {
+    const ids = [...(out.saved || []), ...Object.values(out.detail).flatMap((l) => l || [])].map((t) => t.id).filter(Boolean);
+    const got = await attempt("features", () => loadFeatures(ids, { budgetMs: 40_000 }));
+    out.features = got ? { keys: FEATURE_KEYS, pending: got.pending, ...(got.error ? { error: got.error } : {}), tracks: got.features } : null;
   }
   if (want("tops")) {
     out.top = {};
