@@ -43,6 +43,7 @@ Spotify solo devuelve las últimas 50 reproducciones, así que el servidor las v
 `https://TU-PROYECTO.vercel.app/export/TU_MCP_SECRET` descarga un JSON para analizar fuera del servidor. Solo exporta lo que pidas:
 
 - `?playlists=Perfection,Cool,me_gusta`: esas listas con detalle (fecha de alta incluida). `me_gusta` es una más.
+- `?include=features`: rasgos de audio (ReccoBeats) de las canciones de las listas pedidas. No entra en la exportación sin parámetros.
 - `?include=tops,index,plays`: los tres tops, el índice de todas tus playlists y el registro de escuchas.
 
 Sin parámetros exporta «Me gusta», los tops, el índice y el registro. Si Spotify limita alguna parte, el resto se exporta igual y el motivo queda en `errors`.
@@ -78,4 +79,5 @@ Sin parámetros exporta «Me gusta», los tops, el índice y el registro. Si Spo
 | `find_in_playlists` | En qué playlists propias está cada canción, comparando por ISRC. Indexa las playlists en Blob y solo vuelve a descargar las que cambian. |
 | `recommend` | Motor de recomendación guiado por decisiones recientes: aprende de los veredictos sí/no que guarda (`yes`, `no`) y de lo añadido a la lista desde `since`, no de lo que ya estaba. Devuelve candidatas, dudosas para preguntar y lo de la lista que menos encaja hoy. No cambia nada en Spotify. |
 | `rotate_review` | Rota una playlist de revisión («Dudas»): saca las canciones resueltas (guardadas, quitadas o escuchadas sin guardar), deja las no escuchadas y repone desde una cola. |
+| `audio_features` | Tempo, tonalidad, energía, valencia, acústica, etc. por canción. Spotify cerró ese dato a las apps nuevas, así que se pide a [ReccoBeats](https://reccobeats.com) por id de Spotify (solo ids públicos) y se guarda en Blob. |
 | `auth_status` | Estado de la sesión y enlace para volver a iniciarla. |
